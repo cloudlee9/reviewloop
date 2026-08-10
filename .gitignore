@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# macOS 的目录元数据，跟仓库没关系
+.DS_Store
+
+# 每个项目自己的 review 账本：diff、findings、逐轮回应。
+# 是运行产物不是源码，而且里面有被审代码的完整快照。
+.review-loops/

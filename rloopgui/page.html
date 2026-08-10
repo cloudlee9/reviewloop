@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rloop</title>
+<style>
+:root{
+  --bg:#fbfbfa; --panel:#fff; --line:#e6e4e0; --fg:#22201d; --dim:#8b8680;
+  --ok:#2f7d4f; --warn:#a8701a; --err:#b3402f; --accent:#3b6ea5; --sel:#eef3f9;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#1a1917; --panel:#232120; --line:#35322f; --fg:#e8e4de; --dim:#8a837b;
+  --ok:#6fbf8b; --warn:#d9a05b; --err:#e0705f; --accent:#7aa9d9; --sel:#2b3440;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif}
+/* nowrap + 不许收缩：窄面板里 flex 会把按钮压到一个字一行，全变竖排。
+   放不下就整条横向滚动，别把每个按钮都拧成竹简。 */
+header{display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:nowrap;
+  overflow-x:auto;scrollbar-width:none;
+  border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header::-webkit-scrollbar{display:none}
+header>*{flex:0 0 auto}
+header button{white-space:nowrap}
+header h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.3px}
+header .path{color:var(--dim);font:12px/1 var(--mono);flex:1 1 auto;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button{font:13px inherit;padding:5px 12px;border:1px solid var(--line);border-radius:6px;
+  background:var(--panel);color:var(--fg);cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.45;cursor:default}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.primary:hover:not(:disabled){opacity:.88;color:#fff}
+main{display:grid;grid-template-columns:280px 1fr;height:calc(100vh - 49px)}
+/* 面板被拖窄时（Browser pane 常态），280px 的左栏会把右边压成竖排文字。
+   窄屏改上下排：列表压成一条横向滚动的胶囊，正文拿到整个宽度。 */
+@media (max-width:760px){
+  main{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+  #list{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;
+    border-right:0;border-bottom:1px solid var(--line);padding:8px}
+  .item{flex:0 0 auto;border:1px solid var(--line);border-radius:8px;padding:7px 11px}
+  .item.on{box-shadow:none;border-color:var(--accent)}
+  .item .row{margin-top:3px}
+  #detail{padding:14px 16px 50px}
+  header .path{display:none}
+}
+@media (max-width:460px){ header h1{display:none} }
+#list{border-right:1px solid var(--line);overflow-y:auto;background:var(--panel)}
+.item{padding:9px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+.item:hover{background:var(--sel)}
+.item.on{background:var(--sel);box-shadow:inset 3px 0 0 var(--accent)}
+.item .name{font-size:13px;font-weight:600;line-height:1.35;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .id{font:11px var(--mono);color:var(--dim);margin-top:1px}
+.item .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-top:2px}
+.item .sc{font:12px var(--mono)}
+.tag{font-size:11px;padding:1px 7px;border-radius:10px;border:1px solid currentColor}
+#detail{overflow-y:auto;padding:18px 22px 60px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--line);
+  overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;padding:6px 12px;
+  color:var(--dim);background:none;white-space:nowrap;flex:0 0 auto}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--accent)}
+h2{font-size:13px;margin:22px 0 8px;color:var(--dim);font-weight:600;
+  text-transform:uppercase;letter-spacing:.6px}
+h2:first-child{margin-top:0}
+.meta{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;font-size:13px}
+.meta dt{color:var(--dim)}
+.meta dd{margin:0;word-break:break-all}
+table{border-collapse:collapse;font:12px var(--mono)}
+th,td{padding:3px 14px 3px 0;text-align:left}
+th{color:var(--dim);font-weight:500}
+.f{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;background:var(--panel)}
+.f>summary{padding:9px 12px;cursor:pointer;list-style:none;display:flex;gap:9px;align-items:baseline}
+.f>summary::-webkit-details-marker{display:none}
+.f[open]>summary{border-bottom:1px solid var(--line)}
+.f .body{padding:11px 13px;font-size:13px}
+.f .fix{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);color:var(--dim)}
+.loc{font:11px var(--mono);color:var(--dim)}
+.sev{font-size:11px;padding:1px 7px;border-radius:4px;font-weight:600;white-space:nowrap}
+.sev.err{background:var(--err);color:#fff}
+.sev.warn{background:var(--warn);color:#fff}
+.sev.dim{background:var(--dim);color:var(--bg)}
+.sev.normal{background:var(--line);color:var(--fg)}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)} .dim{color:var(--dim)}
+.accent{color:var(--accent)} .title{font-weight:600} .normal{color:var(--fg)}
+pre{font:12px/1.5 var(--mono);background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word}
+pre.raw{white-space:pre;word-break:normal}
+.d-add{color:var(--ok)} .d-del{color:var(--err)} .d-hd{color:var(--accent);font-weight:600}
+#run{font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word}
+/* 事件的 level 直接当 class 用 —— 面板不做任何 status→颜色的判断，
+   那一步在核心里做完了随数据一起来。 */
+#run .cmd{color:var(--accent)} #run .err{color:var(--err)} #run .warn{color:var(--warn)}
+#run .note{color:var(--dim)} #run .highlight{color:var(--fg);font-weight:600}
+#run .info{color:var(--fg)}
+.empty{color:var(--dim);padding:40px 0;text-align:center}
+button.mini{font-size:11px;padding:1px 8px;margin-left:8px;border-radius:5px;
+  color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0}
+.nudge{background:var(--warn);color:#fff;font-size:11px;padding:2px 9px;
+  border-radius:10px;white-space:nowrap}
+.pill{display:inline-block;font:11px var(--mono);color:var(--dim);
+  border:1px solid var(--line);border-radius:10px;padding:0 7px;margin-left:6px}
+.banner{background:var(--warn);color:#fff;padding:6px 14px;font-size:12px}
+/* 起一轮的参数表单 */
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--panel);
+  color:var(--fg);padding:0;max-width:min(520px,92vw);width:100%}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+dialog .head{padding:13px 16px;border-bottom:1px solid var(--line);font-weight:600}
+dialog .grid{padding:14px 16px;display:grid;grid-template-columns:auto 1fr;
+  gap:9px 12px;align-items:center;font-size:13px}
+dialog .foot{padding:11px 16px;border-top:1px solid var(--line);
+  display:flex;gap:8px;justify-content:flex-end}
+dialog label{color:var(--dim)}
+dialog input,dialog select{font:13px inherit;padding:5px 8px;background:var(--bg);
+  color:var(--fg);border:1px solid var(--line);border-radius:6px;width:100%}
+dialog input:focus,dialog select:focus{outline:none;border-color:var(--accent)}
+dialog .hint{grid-column:1/-1;color:var(--dim);font-size:11px;margin-top:-4px}
+select.rounds{font:12px var(--mono);padding:2px 6px;background:var(--panel);
+  color:var(--fg);border:1px solid var(--line);border-radius:6px;margin-left:8px}
+</style></head><body>
+<div id="banner" class="banner" style="display:none"></div>
+<header>
+  <h1>rloop</h1><span class="path" id="proj"></span>
+  <span id="nudge"></span>
+  <span id="msg" class="dim" style="font-size:12px"></span>
+  <button id="btn-run" class="primary" title="在当前 loop 上再审一轮">审一轮</button>
+  <button id="btn-opts" title="带参数起一轮">参数…</button>
+  <button id="btn-new" title="另起一个 loop">新 loop</button>
+  <button id="btn-stop" disabled title="停掉正在跑的">停</button>
+</header>
+<main>
+  <div id="list"></div>
+  <div id="detail"><div class="empty">选左边一个 loop</div></div>
+</main>
+
+<dialog id="opts">
+  <form method="dialog">
+    <div class="head">起一轮 review</div>
+    <div class="grid">
+      <label for="o-name">名字</label>
+      <input id="o-name" placeholder="列表里好认，比如「GUI 切分」；留空就从改动里推一个">
+      <label for="o-focus">侧重</label>
+      <input id="o-focus" placeholder="这轮想让 reviewer 重点看什么，留空则自己从 diff 推断">
+      <label for="o-base">base</label>
+      <input id="o-base" placeholder="审相对该分支/提交的全部改动，如 main">
+      <label for="o-commit">commit</label>
+      <input id="o-commit" placeholder="只审这一个提交（范围会钉死，之后改工作区不进 diff）">
+      <label for="o-rounds">轮数上限</label>
+      <input id="o-rounds" type="number" min="1" max="99" placeholder="默认 5">
+      <label for="o-score">达标门槛</label>
+      <input id="o-score" type="number" min="0" max="10" step="0.1" placeholder="默认 8.0">
+      <label for="o-reviewer">reviewer</label>
+      <select id="o-reviewer">
+        <option value="">默认（codex）</option>
+        <option value="codex">codex</option>
+        <option value="claude">claude</option>
+      </select>
+      <label for="o-effort">推理档位</label>
+      <select id="o-effort">
+        <option value="">默认</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+      <label for="o-model">模型</label>
+      <input id="o-model" placeholder="留空用 reviewer 的默认模型">
+      <div class="hint" id="o-hint"></div>
+    </div>
+    <div class="foot">
+      <button value="cancel">取消</button>
+      <button value="new" id="o-new">起新 loop</button>
+      <button value="go" class="primary" id="o-go">审一轮</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const T="__TOKEN__";
+const api=p=>fetch(p+(p.includes("?")?"&":"?")+"t="+T).then(r=>r.json());
+const post=(p,b)=>fetch(p+"?t="+T,{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(b||{})}).then(r=>r.json());
+const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+let loops=[], cur=null, detail=null, tab="result", fileCache={}, es=null;
+let runBuf=[], lastSeq=0, following=null, meta={}, viewRound=null;
+
+// 面板不做任何 status→颜色的判断：class 随数据一起从核心来。
+const cls = x => (x||"normal");
+
+function shortWhen(l){
+  // id 前半截就是时间戳（20260810-010527），拆出来比整串好认
+  const m=/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/.exec(l.id||"");
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : (l.started_at||"").slice(0,16);
+}
+
+function fmtScore(l){
+  if(l.deliverable==null) return "—";
+  return `${l.deliverable}/${l.production} 阻塞 ${l.blocking}`;
+}
+
+function chart(h,min){
+  if(!h.length) return "";
+  const W=560,H=120,P=28, xs=(i)=>P+i*(W-2*P)/Math.max(1,h.length-1);
+  // 纵轴贴着数据走，不是写死 0–10：分数几乎总在 6–9 之间，固定尺度会把
+  // 「7.1 爬到 8.3」画成一条平线，而那条线正是这张图唯一想说的事。
+  // 门槛也参与取值范围，保证虚线一定在画面内。
+  const vals=h.flatMap(r=>[r.deliverable_maturity,r.production_readiness]);
+  if(min!=null) vals.push(min);
+  const span=Math.max(1,Math.max(...vals)-Math.min(...vals));
+  const lo=Math.min(...vals)-span*.35, hi=Math.max(...vals)+span*.35;
+  const ys=v=>H-P-(v-lo)/(hi-lo)*(H-2*P);
+  const path=k=>h.map((r,i)=>`${i?"L":"M"}${xs(i).toFixed(1)},${ys(r[k]).toFixed(1)}`).join("");
+  const gate=min!=null?`<line x1="${P}" x2="${W-P}" y1="${ys(min).toFixed(1)}" y2="${ys(min).toFixed(1)}"
+      stroke="currentColor" stroke-dasharray="3 4" opacity=".35"/>`:"";
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto;color:var(--dim)">
+    ${gate}
+    <path d="${path("deliverable_maturity")}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <path d="${path("production_readiness")}" fill="none" stroke="var(--warn)" stroke-width="2"/>
+    ${h.map((r,i)=>`<circle cx="${xs(i).toFixed(1)}" cy="${ys(r.deliverable_maturity).toFixed(1)}" r="2.5" fill="var(--accent)"/>
+      <circle cx="${xs(i).toFixed(1)}" cy="${ys(r.production_readiness).toFixed(1)}" r="2.5" fill="var(--warn)"/>
+      <text x="${xs(i).toFixed(1)}" y="${H-8}" font-size="9" text-anchor="middle" fill="currentColor">${r.round}</text>`).join("")}
+    <text x="${P}" y="12" font-size="9" fill="var(--accent)">交付物</text>
+    <text x="${P+46}" y="12" font-size="9" fill="var(--warn)">生产就绪</text>
+  </svg>`;
+}
+
+function drawList(){
+  const el=document.getElementById("list");
+  if(!loops.length){ el.innerHTML=`<div class="empty">还没有 loop</div>`; return; }
+  el.innerHTML=loops.map((l,i)=>`
+    <div class="item ${cur&&cur.id===l.id?"on":""}" data-id="${esc(l.id)}"
+         title="${esc(l.id)}　${esc(l.scope)}">
+      <div class="name">${esc(l.title||"（未命名）")}${l.is_active?'<span class="pill">当前</span>':""}</div>
+      <div class="id">${esc(l.project_name)} · ${esc(shortWhen(l))}</div>
+      <div class="row">
+        <span class="tag ${cls(l.status_class)}">${esc(l.status)}</span>
+        <span class="sc">${esc(fmtScore(l))}</span>
+      </div>
+      <div class="row">
+        <span class="dim" style="font-size:11px">第 ${l.round}/${l.max_rounds} 轮</span>
+        ${l.running?'<span class="accent" style="font-size:11px">跑着</span>':""}
+        ${l.needs_response?'<span class="nudge">待回应</span>':""}
+      </div>
+    </div>`).join("");
+  el.querySelectorAll(".item").forEach(d=>d.onclick=()=>select(d.dataset.id));
+}
+
+function findLoop(id){ return loops.find(l=>l.id===id); }
+
+async function select(id, rnd){
+  viewRound = rnd===undefined ? null : rnd;
+  fileCache={};
+  const r=await api(`/api/loop?id=${encodeURIComponent(id)}`+(viewRound?`&round=${viewRound}`:""));
+  if(!r.ok){ document.getElementById("detail").innerHTML=`<div class="empty err">${esc(r.msg)}</div>`; return; }
+  detail=r.data;
+  // cur 用返回来的 summary，**不查本地列表**：刚起的一轮，state 事件还没到，
+  // 本地列表里根本没有它 —— 早先在这儿查表查不到就直接 return，症状是点完
+  // 「审一轮」右边一直停在「选左边一个 loop」。
+  cur=detail.loop;
+  if(!findLoop(id)) loops.unshift(cur);
+  drawList(); syncHeader();
+  if(tab!=="run") drawDetail(); else drawRun();
+  reconnect();          // 换 loop = 换 follower
+}
+
+function syncHeader(){
+  const anyRunning=loops.some(l=>l.running);
+  document.getElementById("btn-stop").disabled=!(cur&&cur.running);
+  // fix_allowed=false 表示范围钉死在历史提交上，改工作区也进不了送审 diff。
+  // 按下去必然起一个注定报 pinned_scope 的进程，所以直接禁掉并说清楚。
+  const pinned = cur && cur.fix_allowed===false;
+  for(const id of ["btn-run","btn-opts","btn-new"]){
+    const b=document.getElementById(id);
+    b.disabled = anyRunning || (id!=="btn-new" && pinned);
+    b.title = pinned && id!=="btn-new"
+      ? "这个 loop 的范围钉死在历史提交上，改工作区也不会进入送审 diff"
+      : (anyRunning ? "有一轮正在跑" : b.dataset.tip||b.title);
+  }
+  document.getElementById("nudge").innerHTML =
+    cur&&cur.needs_response ? `<span class="nudge">这一轮等你写回应</span>` : "";
+}
+
+function drawDetail(){
+  if(!detail){ document.getElementById("detail").innerHTML=`<div class="empty">选左边一个 loop</div>`; return; }
+  const l=detail.loop, rv=detail.review;
+  const arts=Object.fromEntries((detail.artifacts||[]).map(a=>[a.what,a]));
+  const TABS=[["result","结果"],["run","进度"],["diff","送审 diff"],
+    ["review-md","review.md"],["report","报告"],["prompt","reviewer 输入"],
+    ["response","回应"],["reviewer-log","reviewer 日志"],["loop-log","loop 日志"],
+    ["progress","事件流"],["result-raw","原始 JSON"]];
+  const rounds=l.rounds_available||[];
+  const cr = viewRound || detail.round;
+
+  const head=`<div class="tabs">${TABS.map(([k,t])=>
+      `<button data-tab="${k}" class="${tab===k?"on":""}">${t}</button>`).join("")}
+    ${rounds.length>1?`<select class="rounds" id="round-sel">${rounds.map(n=>
+      `<option value="${n}" ${n===cr?"selected":""}>第 ${n} 轮</option>`).join("")}</select>`:""}
+  </div>`;
+
+  let body="";
+  if(tab==="result") body=resultView(l,rv,detail);
+  else if(tab==="run") body=`<div id="run">${runBuf.join("")||'<span class="dim">还没有进度。起一轮，或者选一个跑过的轮次。</span>'}</div>`;
+  else body=fileView(tab, arts);
+
+  document.getElementById("detail").innerHTML=head+body;
+  document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{
+    tab=b.dataset.tab; drawDetail(); if(tab!=="result"&&tab!=="run") loadFile(tab);
+  });
+  const sel=document.getElementById("round-sel");
+  if(sel) sel.onchange=()=>select(l.id, +sel.value);
+  if(tab!=="result"&&tab!=="run"&&!fileCache[tab+cr]) loadFile(tab);
+}
+
+function resultView(l,rv,d){
+  const fc=d.findings_class||{}, pc=d.prior_class||{};
+  const fs=(rv&&rv.findings)||[], prior=(rv&&rv.prior_findings_status)||[];
+  const resp=d.response||{};
+  let h=`<h2>概况</h2><dl class="meta">
+    ${l.title?`<dt>名字</dt><dd>${esc(l.title)}</dd>`:""}
+    <dt>状态</dt><dd class="${cls(l.status_class)}">${esc(l.status)} — ${esc(l.outcome_reason||"")}</dd>
+    <dt>轮次</dt><dd>第 ${d.round} / ${l.max_rounds} 轮，门槛 ${l.min_score}</dd>
+    <dt>范围</dt><dd>${esc(l.scope)}</dd>
+    ${l.focus?`<dt>侧重</dt><dd>${esc(l.focus)}</dd>`:""}
+    <dt>reviewer</dt><dd>${esc(l.reviewer)}${l.reviewer_model?" / "+esc(l.reviewer_model):""}
+      ${l.reviewer_effort?`<span class="pill">${esc(l.reviewer_effort)}</span>`:""}</dd>
+    <dt>目录</dt><dd class="loc">${esc(l.root)}</dd>
+  </dl>`;
+
+  if((l.consistency_errors||[]).length)
+    h+=`<h2 class="err">结果不自洽</h2><ul class="err">${l.consistency_errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul>`;
+
+  if(d.history&&d.history.length){
+    h+=`<h2>走势</h2>${chart(d.history,l.min_score)}
+      <table><tr><th>轮</th><th>交付物</th><th>生产就绪</th><th>阻塞</th><th>判定</th></tr>
+      ${d.history.map(r=>`<tr class="${cls(r.row_class)}"><td>${r.round}</td>
+        <td>${r.deliverable_maturity}</td><td>${r.production_readiness}</td>
+        <td>${r.blocking_findings}</td><td>${esc(r.verdict)}
+        ${({up:"↑",down:"↓",flat:"=",start:""})[r.delta]||""}</td></tr>`).join("")}</table>`;
+  }
+
+  if(!d.review_valid) h+=`<h2>本轮结果</h2><div class="dim">这一轮还没有可用的 review 结果。</div>`;
+  else{
+    if(rv.summary) h+=`<h2>小结</h2><div>${esc(rv.summary)}</div>`;
+    if(fs.length){
+      h+=`<h2>findings（${fs.length}）<button class="mini" id="copy-f">复制为 markdown</button></h2>`;
+      h+=fs.map(f=>`<details class="f"><summary>
+          <span class="sev ${cls(fc[f.id])}">${esc(f.severity)}</span>
+          <b>${esc(f.id)}</b><span>${esc((f.description||"").slice(0,90))}</span>
+        </summary><div class="body">
+          <div class="loc">${esc(f.file||"")}${f.line?":"+f.line:""} · ${esc(f.category||"")}</div>
+          <p>${esc(f.description)}</p>
+          ${f.suggested_fix?`<div class="fix">建议：${esc(f.suggested_fix)}</div>`:""}
+        </div></details>`).join("");
+    }
+    if(prior.length){
+      h+=`<h2>上一轮问题的裁决</h2>`+prior.map(p=>`<details class="f"><summary>
+        <span class="sev ${cls(pc[p.id])}">${esc(p.status)}</span><b>${esc(p.id)}</b>
+        <span>${esc((p.description||"").slice(0,80))}</span></summary>
+        <div class="body">${esc(p.note||"")}</div></details>`).join("");
+    }
+    if((rv.positive_evidence||[]).length)
+      h+=`<h2>正面证据</h2><ul>${rv.positive_evidence.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`;
+    if((rv.validation_commands||[]).length)
+      h+=`<h2>它实际跑了什么</h2><table>${rv.validation_commands.map(c=>
+        `<tr><td class="${c.outcome==="pass"?"ok":"err"}">${esc(c.outcome)}</td>
+         <td>${esc(c.command)}</td></tr>`).join("")}</table>`;
+    if((rv.next_priorities||[]).length)
+      h+=`<h2>它建议先做什么</h2><ol>${rv.next_priorities.map(x=>`<li>${esc(x)}</li>`).join("")}</ol>`;
+  }
+
+  // findings 的出口是「复制 + 路径」，不是面板自己写回应 —— 写回应的那一方
+  // 得有这些代码为什么写成现在这样的上下文，面板没有。
+  h+=`<h2>逐条回应</h2><div class="dim" style="font-size:13px">
+    ${resp.exists?`已经写了 ${resp.chars} 字。`:"还没写。"}
+    回应由你的开发会话写（它有这份代码的上下文），面板只负责显示。<br>
+    <span class="loc">${esc(resp.path||"")}</span>
+    <button class="mini" id="copy-path">复制路径</button></div>`;
+  return h;
+}
+
+function fileView(what, arts){
+  const cr = viewRound || (detail&&detail.round);
+  const key=what+cr, got=fileCache[key];
+  if(got===undefined) return `<div class="empty">读取中…</div>`;
+  if(got===null) return `<div class="empty dim">没有这份产物。</div>`;
+  if(got.error) return `<div class="empty err">${esc(got.error)}</div>`;
+  const warn=got.truncated?`<div class="dim" style="font-size:12px;margin-bottom:8px">
+    内容已截断（原始 ${got.bytes} 字节）。完整文件：<span class="loc">${esc(got.path)}</span></div>`:"";
+  const rendered=got.rendered?`<div class="dim" style="font-size:12px;margin-bottom:8px">
+    这份还没落盘，下面是现渲染的。</div>`:"";
+  const body = what==="diff" ? hlDiff(got.text) : esc(got.text);
+  return warn+rendered+`<pre class="${what==="diff"?"raw":""}">${body}</pre>`;
+}
+
+function hlDiff(t){
+  return String(t||"").split("\n").map(l=>{
+    const e=esc(l);
+    if(/^(diff |index |--- |\+\+\+ |@@)/.test(l)) return `<span class="d-hd">${e}</span>`;
+    if(l.startsWith("+")) return `<span class="d-add">${e}</span>`;
+    if(l.startsWith("-")) return `<span class="d-del">${e}</span>`;
+    return e;
+  }).join("\n");
+}
+
+async function loadFile(what){
+  const cr = viewRound || (detail&&detail.round);
+  const key=what+cr;
+  if(fileCache[key]!==undefined) return;
+  const w = what==="result-raw" ? "result" : what;
+  const r=await api(`/api/file?id=${encodeURIComponent(cur.id)}&what=${encodeURIComponent(w)}`
+    +(cr?`&round=${cr}`:""));
+  fileCache[key] = r.ok ? r.data : (r.code==="not_found" ? null : {error:r.msg});
+  if(tab===what) drawDetail();
+}
+
+// ── 事件流：一条 SSE = 一个 follower。断线重连带上 since，核心只补没见过的。 ──
+function reconnect(){
+  if(es){ es.close(); es=null; }
+  const rnd = viewRound || (cur&&cur.round) || "";
+  // 订阅身份必须带上 loop id：seq 是**每个 loop/每一轮各自**的序列，
+  // 光用轮次号做身份的话，从 loop A 的第 1 轮切到 loop B 的第 1 轮时
+  // 身份没变，lastSeq 还留着 A 的，B 那些序号更小的事件会被当成「见过的」
+  // 整段丢掉 —— 换个 loop 看看进度就空了。
+  const key = `${(cur&&cur.id)||""}#${rnd}`;
+  if(following!==key){ runBuf=[]; lastSeq=0; following=key; }
+  const q=new URLSearchParams({t:T});
+  if(cur){ q.set("loop",cur.id); if(rnd) q.set("round",rnd); q.set("since",String(lastSeq)); }
+  es=new EventSource("/api/events?"+q);
+  es.onmessage=e=>{
+    let ev; try{ ev=JSON.parse(e.data); }catch{ return; }
+    if(typeof ev.seq==="number"){
+      if(ev.seq<=lastSeq) return;       // 第二道防线，服务端已经裁过
+      lastSeq=ev.seq;
+    }
+    onEvent(ev);
+  };
+  es.onerror=()=>{};                    // EventSource 自己会重连
+}
+
+function onEvent(ev){
+  if(ev.kind==="state"){
+    const s=ev.data&&ev.data.loop; if(!s) return;
+    const i=loops.findIndex(l=>l.id===s.id);
+    if(i<0) loops.unshift(s); else loops[i]=s;
+    if(cur&&cur.id===s.id){
+      const was=cur; cur=s;
+      // 轮次变了、或者跑起来了、或者跑完了，都得重新订阅：follower 是钉在
+      // 某一轮的 progress 文件上的。只处理「跑完」的话，别的终端给这个 loop
+      // 起了下一轮时，本面板会显示它正在跑，却一条实时进度都收不到 ——
+      // 那正好打掉「不拥有 reviewer 进程也能看进度」这个目的。
+      const moved = was.round!==s.round || was.running!==s.running;
+      // 用户手动钉在某个历史轮次时别把他拽走；跟随当前轮才自动切。
+      if(moved && viewRound===null) select(s.id);
+    }
+    drawList(); syncHeader();
+    return;
+  }
+  if(ev.kind==="heartbeat") return;
+  const line=`<span class="${cls(ev.level)}">${esc(ev.text||"")}</span>\n`;
+  runBuf.push(line);
+  if(runBuf.length>4000) runBuf.splice(0,runBuf.length-4000);
+  if(tab==="run"){
+    if(runBuf.length===1){
+      // 第一条来了就整块重绘：这块原本显示的是「还没有进度」的占位文字，
+      // 直接 append 会把第一条事件接在那句话屁股后面。
+      drawDetail();
+    }else{
+      const el=document.getElementById("run");
+      if(el){ el.insertAdjacentHTML("beforeend",line);
+        el.parentElement.scrollTop=el.parentElement.scrollHeight; }
+    }
+  }
+  // 收尾事件触发一次刷新，但有两个前提：
+  //   · seq 是数字 —— 也就是**文件里真有**这条。合成事件（follower 探到 runner
+  //     没了自己补的那条）不能触发：重订阅后新 follower 会再探到同样的情况、
+  //     再合成一条，一路循环下去。
+  //   · 正在跟当前轮 —— 翻回历史轮次时，那一轮的 run.end 是早就发生过的事，
+  //     拿它去「刷新」等于把用户从他刚选的那一轮弹回当前轮，下拉看着像没反应。
+  if(ev.kind==="run.end"&&cur&&typeof ev.seq==="number"&&viewRound===null)
+    setTimeout(()=>select(cur.id),400);
+}
+
+function drawRun(){ drawDetail(); }
+
+// ── 起一轮 ──
+function formOpts(){
+  const v=id=>document.getElementById(id).value.trim();
+  const o={};
+  if(v("o-name")) o.label=v("o-name");
+  if(v("o-focus")) o.focus=v("o-focus");
+  if(v("o-base")) o.base=v("o-base");
+  if(v("o-commit")) o.commit=v("o-commit");
+  if(v("o-rounds")) o.max_rounds=+v("o-rounds");
+  if(v("o-score")) o.min_score=+v("o-score");
+  if(v("o-reviewer")) o.reviewer=v("o-reviewer");
+  if(v("o-effort")) o.reviewer_effort=v("o-effort");
+  if(v("o-model")) o.reviewer_model=v("o-model");
+  return o;
+}
+
+async function go(opts){
+  const msg=document.getElementById("msg");
+  msg.textContent="起一轮…"; msg.className="dim";
+  runBuf=[]; lastSeq=0; following=null; tab="run"; drawDetail();
+  const r=await post("/api/run", opts||{});
+  if(!r.ok){
+    msg.textContent=r.msg||"起不来"; msg.className="err";
+    // 起不来时把核心自己说的原话摊开 —— 那句话才有信息量
+    const raw=(r.detail&&r.detail.stderr)||"";
+    if(raw) document.getElementById("detail").innerHTML=
+      `<h2 class="err">起不来</h2><div>${esc(r.msg)}</div>
+       ${r.hint?`<div class="dim">${esc(r.hint)}</div>`:""}
+       <h2>rloop 自己说的</h2><pre class="raw">${esc(raw)}</pre>`;
+    return;
+  }
+  msg.textContent="";
+  if(r.data.loop){ await select(r.data.loop); tab="run"; drawDetail(); }
+  else { msg.textContent="loop 还在创建中…"; reconnect(); }
+}
+
+document.getElementById("btn-run").onclick=()=>go({});
+document.getElementById("btn-new").onclick=()=>go({new:true});
+document.getElementById("btn-opts").onclick=()=>document.getElementById("opts").showModal();
+document.getElementById("btn-stop").onclick=async()=>{
+  if(!cur) return;
+  const r=await post("/api/stop",{id:cur.id});
+  const msg=document.getElementById("msg");
+  msg.className="dim";
+  msg.textContent = r.ok ? (r.data.was_running?"已停":"它本来就没在跑") : (r.msg||"停不掉");
+};
+document.getElementById("opts").addEventListener("close",e=>{
+  const v=document.getElementById("opts").returnValue;
+  if(v==="go") go(formOpts());
+  else if(v==="new") go({...formOpts(), new:true});
+});
+document.addEventListener("click",e=>{
+  if(e.target.id==="copy-path"&&detail)
+    navigator.clipboard?.writeText(detail.response.path||"");
+  if(e.target.id==="copy-f"&&detail&&detail.review){
+    const md=(detail.review.findings||[]).map(f=>
+      `## ${f.id} [${f.severity}] ${f.file||""}${f.line?":"+f.line:""}\n\n`+
+      `${f.description}\n\n建议：${f.suggested_fix||"—"}\n`).join("\n");
+    navigator.clipboard?.writeText(md);
+    e.target.textContent="已复制";
+    setTimeout(()=>e.target.textContent="复制为 markdown",1500);
+  }
+});
+
+(async function boot(){
+  const m=await api("/api/meta");
+  if(m.ok){
+    meta=m.data.contract||{};
+    document.getElementById("proj").textContent=m.data.project||"";
+    if(!m.data.matches&&m.data.note){
+      const b=document.getElementById("banner");
+      b.textContent=m.data.note; b.style.display="block";
+    }
+    const d=meta.defaults||{};
+    document.getElementById("o-hint").textContent =
+      `留空即用默认：门槛 ${d.min_score}，最多 ${d.max_rounds} 轮，reviewer ${d.reviewer}。`;
+  }
+  const r=await api("/api/loops");
+  if(r.ok){ loops=r.data.loops||[]; drawList(); }
+  const active=loops.find(l=>l.is_active)||loops[0];
+  if(active) await select(active.id); else reconnect();
+})();
+</script></body></html>
