@@ -415,7 +415,9 @@ def test_context_pack_writes_the_pinned_patch(tmp_path):
 
     patch = (loop.round_dir(1) / "diff.patch").read_text(encoding="utf-8")
     assert "TARGET_CHANGE" in patch and "LATER_CHANGE" not in patch
-    assert "只读沙箱" in pack, "reviewer 得知道自己是只读的"
+    # 权限那节归 test_the_pack_tells_the_reviewer_what_it_can_actually_do 守，
+    # 这里只确认它确实被拼进来了 —— 档位由 loop 的 verify 决定，不该在这条里写死。
+    assert "## 你的权限" in pack
 
 
 def test_context_pack_tells_the_reviewer_untracked_content_is_inline(tmp_path):
@@ -507,6 +509,97 @@ def test_an_untracked_file_edited_in_place_still_moves_the_fingerprint(tmp_path)
     after = rloop.workspace_fingerprint(repo)
     assert rloop.fingerprint_changed(before, after) == ["untracked"], "同长度改写没被指纹看见"
     assert rloop.tampered_dimensions(before, after) == ["untracked"]
+
+
+def test_binary_changes_do_not_silently_drop_the_diff_dimension(tmp_path):
+    """自审抓到的漏判，是这批里最要命的一个。
+
+    `git diff HEAD` 一度用 text=True 取输出：仓库里只要有一个二进制改动或非
+    UTF-8 编码的源文件，解码就抛 UnicodeDecodeError，被 suppress 一吞，`diff`
+    这个键干脆不存在 —— 而「缺的键不参与比较」意味着整条最重要的维度**静默消失**，
+    reviewer 改任何已跟踪文件都抓不到。
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    (repo / "bin.dat").write_bytes(b"\xff\xfe\x00binary")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "bin")
+
+    before = rloop.workspace_fingerprint(repo)
+    assert "diff" in before, "有二进制文件在，diff 维度就整个丢了"
+    assert len(before) == len(rloop.FINGERPRINT_KEYS)
+
+    (repo / "bin.dat").write_bytes(b"\xff\xfe\x00BINARY-CHANGED")
+    assert rloop.tampered_dimensions(before, rloop.workspace_fingerprint(repo)) == ["diff"]
+
+
+def test_a_new_untracked_file_does_not_reclassify_its_neighbours(tmp_path):
+    """算不算 hash 只看文件自己有多大，不看它排第几。
+
+    先前按名次切（前 100 个算 hash），于是 reviewer 新建一个排序靠前的文件就能把
+    原来的第 100 名挤成第 101 名 —— 那条记录从 sha256 变成 mtime，内容一个字节
+    没动却看着像被改了。这是一条纯粹由邻居造成的误作废。
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    for i in range(rloop.UNTRACKED_MAX_FILES + 5):
+        (repo / f"m{i:03d}.txt").write_text(f"{i}\n", encoding="utf-8")
+
+    before = rloop.workspace_fingerprint(repo)
+    (repo / "AAA-first.txt").write_text("挤到最前面\n", encoding="utf-8")
+    after = rloop.workspace_fingerprint(repo)
+
+    assert rloop.tampered_dimensions(before, after) == [], "新增文件把邻居连坐了"
+    assert rloop.new_paths(before, after) == ["AAA-first.txt"]
+
+
+def test_a_tab_in_a_filename_does_not_collapse_the_untracked_map(tmp_path):
+    """git 的 -z 输出不转义路径，路径里的 TAB 会把「摘要\t路径」的解析切错位。"""
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    (repo / "we\tird.txt").write_text("1", encoding="utf-8")
+    (repo / "we\tirdX.txt").write_text("1", encoding="utf-8")
+
+    before = rloop.workspace_fingerprint(repo)
+    (repo / "we\tird.txt").write_text("22", encoding="utf-8")
+
+    assert rloop.tampered_dimensions(before, rloop.workspace_fingerprint(repo)) == ["untracked"], \
+        "文件名里的 TAB 让改动漏报了"
+
+
+def test_a_symlink_to_a_character_device_does_not_hang_the_fingerprint(tmp_path):
+    """指纹没有超时兜着 —— 一个指向 /dev/zero 的未跟踪符号链接就能让它永远读下去。"""
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    (repo / "trap").symlink_to("/dev/zero")
+
+    fp = rloop.workspace_fingerprint(repo)          # 不许挂在这儿
+    assert len(fp) == len(rloop.FINGERPRINT_KEYS)
+    assert any("trap" in row for row in fp["untracked"]), "符号链接该被记下来，只是不读它"
+
+
+def test_a_file_named_like_the_ledger_is_not_excluded(tmp_path):
+    """账本排除按路径段判断，不是子串匹配。
+
+    先前 `LOOP_DIRNAME not in x` 会把 `notes-about-.review-loops.md` 这种普通文件
+    整个排除在指纹之外 —— reviewer 改它不留痕迹，而它照样会进送审补丁。
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    decoy = repo / f"notes-about-{rloop.LOOP_DIRNAME}.md"
+    decoy.write_text("一份普通文档\n", encoding="utf-8")
+
+    before = rloop.workspace_fingerprint(repo)
+    assert any(decoy.name in row for row in before["untracked"]), "名字像账本的普通文件被漏掉了"
+
+    decoy.write_text("被改过\n", encoding="utf-8")
+    assert rloop.tampered_dimensions(before, rloop.workspace_fingerprint(repo)) == ["untracked"]
+
+    # 真的账本目录仍然要排除掉 —— 否则每轮都误报
+    (repo / rloop.LOOP_DIRNAME).mkdir()
+    (repo / rloop.LOOP_DIRNAME / "loop.log").write_text("x", encoding="utf-8")
+    after = rloop.workspace_fingerprint(repo)
+    assert not any(rloop.LOOP_DIRNAME + "/" in row for row in after["untracked"])
 
 
 def test_a_non_repo_cannot_be_fingerprinted_and_that_is_visible(tmp_path):

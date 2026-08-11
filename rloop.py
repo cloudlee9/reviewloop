@@ -3,7 +3,7 @@
 """
 rloop — 用另一个模型独立审当前工作区的改动
 
-跑一轮就返回：起一个无头、无状态、只读的 reviewer 子进程，审当前改动，
+跑一轮就返回：起一个无头、无状态的 reviewer 子进程审当前改动（默认能跑测试，但动了被审代码这一轮就作废），
 给出结构化 findings 与双评分，用退出码表达判定。
 
 循环由调用方驱动——通常是你正在用的那个开发会话：它读 findings、动手改、
@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import re
 import shutil
 import signal
@@ -224,11 +225,8 @@ REVIEW_CHECKLIST = """\
 把跑过的命令和结果如实填进 validation_commands。一个都没跑就老实标 "not_run"，
 不要声称你没做过的验证。
 
-你在一个只读沙箱里，任何往磁盘写的动作都会失败 —— 包括一些你想不到的地方，
-比如测试框架的临时目录。**同一个测试运行器失败两次就别再试了**：换什么参数都绕不过去，
-每试一次都白费一轮本可以用来读代码的机会。只读环境下真正管用的是：读源码、`git diff`、
-`ast.parse`、以及直接 import 模块调纯函数（`python3 -c 'import x; ...'`）。
-失败的尝试如实记成 fail，然后往下走。
+跑不动的时候如实记成 fail 或 not_run，写清楚为什么，然后往下走 —— 你这一轮
+具体能做什么，「你的权限」那节说了算。
 """
 
 
@@ -313,12 +311,20 @@ def list_untracked(project: Path) -> list[str]:
 
 
 def file_fingerprint(project: Path, path: str) -> tuple[int | None, str | None]:
-    """(字节数, sha256)。文件读不了就给 (None, None)，太大就不算哈希。"""
+    """(字节数, sha256)。文件读不了就给 (None, None)，太大就不算哈希。
+
+    **只读普通文件。** 用 lstat 不跟符号链接：一个指向 `/dev/zero` 的链接会让
+    下面那个读循环永远读下去，而 workspace_fingerprint 没有超时兜着 —— 一个
+    未跟踪的符号链接就能把整个 rloop 挂死。
+    """
     full = project / path
     try:
-        size = full.stat().st_size
+        st = os.lstat(full)
     except OSError:
         return None, None
+    if not stat.S_ISREG(st.st_mode):
+        return None, None
+    size = st.st_size
     if size > UNTRACKED_MAX_HASH_BYTES:
         return size, None
     h = hashlib.sha256()
@@ -607,6 +613,16 @@ def render_score_history(history: list) -> str:
     return "\n".join(rows)
 
 
+def is_ledger_path(path: str) -> bool:
+    """这条路径属于 rloop 自己的账本吗。
+
+    按**路径段**判断，不是子串匹配 —— `notes-about-.review-loops.md` 这种普通
+    文件不该因为名字里带了这几个字就整个被排除在指纹之外。
+    """
+    return path == LOOP_DIRNAME or path.startswith(LOOP_DIRNAME + "/") \
+        or f"/{LOOP_DIRNAME}/" in path
+
+
 def workspace_fingerprint(project: Path) -> dict:
     """给整个工作区拍一张指纹，用来核对 reviewer 有没有动过代码。
 
@@ -623,45 +639,63 @@ def workspace_fingerprint(project: Path) -> dict:
     **排除 .review-loops/** —— 那是 rloop 自己每轮都在写的账本。ignored 的文件
     本来就不在 porcelain / ls-files --exclude-standard 的输出里，所以
     `__pycache__` 这类被仓库忽略掉的测试产物不会惊动指纹。
+
+    **全程走 bytes，不解码。** 早先 `git diff HEAD` 用 `text=True` 拿输出，仓库里
+    只要有一个二进制改动或非 UTF-8 编码的源文件，解码就抛 UnicodeDecodeError，
+    被这里的 suppress 一吞，`diff` 这个键干脆不存在 —— 而 `fingerprint_changed`
+    的规则是「缺的键不参与比较」，于是整条最重要的维度**静默消失**，reviewer 改
+    任何已跟踪文件都抓不到。文件名同理：非 UTF-8 的路径会让 status / ls-files
+    整维度丢掉。指纹要的只是「变没变」，本来就不需要认字。
     """
     out = {}
     with contextlib.suppress(Exception):
         r = subprocess.run(["git", "-C", str(project), "status", "--porcelain=v1", "-z"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, timeout=60)
         if r.returncode == 0:
             out["status"] = sorted(
-                x for x in r.stdout.split("\0") if x and LOOP_DIRNAME not in x)
+                x for x in (v.decode("utf-8", "surrogateescape")
+                            for v in r.stdout.split(b"\0") if v)
+                if not is_ledger_path(x[3:] if len(x) > 3 else x))
     with contextlib.suppress(Exception):
         r = subprocess.run(["git", "-C", str(project), "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=30)
-        out["head"] = r.stdout.strip() if r.returncode == 0 else ""
+        if r.returncode == 0:
+            # 失败时**不设这个键**。设成空串的话，两次都失败就变成「head 没变」，
+            # 而 note_incomplete_fingerprint 也看不出这一维其实没拍到。
+            out["head"] = r.stdout.strip()
     # 已跟踪文件的内容摘要：git status 只报「变没变」，同一个文件被改两次
     # 状态字符串是一样的，光看它抓不到 reviewer 在作者改动之上又动了一笔。
     with contextlib.suppress(Exception):
         r = subprocess.run(["git", "-C", str(project), "diff", "HEAD"],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, timeout=120)
         if r.returncode == 0:
-            out["diff"] = hashlib.sha256(r.stdout.encode("utf-8", "replace")).hexdigest()
-    # 未跟踪文件：**真的把内容 hash 掉**。先前只记大小和 mtime，理由是"改内容不可能
-    # 既不改大小又不动 mtime" —— reviewer 当场证伪了：把同长度的 aaaa 改成 bbbb 再
-    # os.utime 复原时间戳，三个维度全静止。会内联进送审补丁的就是排在前面的这 100 个，
-    # 为它们读一遍内容不算贵；再往后的本来也进不了补丁，退回元数据即可。
+            out["diff"] = hashlib.sha256(r.stdout).hexdigest()
+    # 未跟踪文件：**真的把内容 hash 掉**。先前只记大小和 mtime，理由是「改内容不可能
+    # 既不改大小又不动 mtime」—— reviewer 当场证伪了：把同长度的 aaaa 改成 bbbb 再
+    # os.utime 复原时间戳，三个维度全静止。
+    #
+    # 算不算 hash **只看这个文件自己有多大**，不看它排第几。按名次切（前 100 个算
+    # hash）会让记录方式取决于邻居：reviewer 新建一个排序靠前的文件，就能把原来的
+    # 第 100 名挤成第 101 名，那条记录从 sha256 变成 mtime —— 内容一个字节没动，
+    # 却看着像被改了。这是 reviewer 自己算出来的误作废路径。
     with contextlib.suppress(Exception):
         r = subprocess.run(["git", "-C", str(project), "ls-files", "--others",
                             "--exclude-standard", "-z"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, timeout=60)
         if r.returncode == 0:
             rows = []
-            for i, name in enumerate(
-                    sorted(x for x in r.stdout.split("\0") if x and LOOP_DIRNAME not in x)):
-                if i < UNTRACKED_MAX_FILES:
-                    size, digest = file_fingerprint(project, name)
-                    rows.append(f"{name}\t{size}\t{digest or '?'}")
-                    continue
-                st = None
-                with contextlib.suppress(OSError):
-                    st = (project / name).stat()
-                rows.append(f"{name}\t{st.st_size}\t~{st.st_mtime_ns}" if st else f"{name}\t?")
+            for name in sorted(x for x in (v.decode("utf-8", "surrogateescape")
+                                           for v in r.stdout.split(b"\0") if v)
+                               if not is_ledger_path(x)):
+                size, digest = file_fingerprint(project, name)
+                if digest is None:      # 读不了 / 太大：退回元数据，并标明这维降级了
+                    st = None
+                    with contextlib.suppress(OSError):
+                        st = (project / name).stat()
+                    digest = f"~{st.st_mtime_ns}" if st else "~?"
+                # meta 在前、路径在后：路径里可能有 TAB（git 不会替你转义），放前面
+                # 会让 partition 从文件名中间断开，两个同前缀的文件互相掩盖。
+                rows.append(f"{size}\t{digest}\t{name}")
             out["untracked"] = rows
     return out
 
@@ -677,6 +711,21 @@ def fingerprint_changed(before: dict, after: dict) -> list[str]:
             if k in before and k in after and before[k] != after[k]]
 
 
+def _untracked_map(rows) -> dict:
+    """未跟踪指纹行 → {路径: 内容摘要}。
+
+    行的格式是 `size\tdigest\t路径`，摘要在前、路径在后 —— 路径里可能带 TAB
+    （git 的 `-z` 输出不做转义），放前面会让解析从文件名中间断开。
+    """
+    out = {}
+    for row in rows or []:
+        size, _, rest = row.partition("\t")
+        digest, _, name = rest.partition("\t")
+        if name:
+            out[name] = f"{size}\t{digest}"
+    return out
+
+
 def tampered_dimensions(before: dict, after: dict) -> list[str]:
     """指纹里能说明**被审的代码被动过**的那些维度。
 
@@ -687,9 +736,7 @@ def tampered_dimensions(before: dict, after: dict) -> list[str]:
     """
     dims = [k for k in ("head", "diff") if k in before and k in after and before[k] != after[k]]
     if before.get("untracked") is not None and after.get("untracked") is not None:
-        def by_name(rows):
-            return dict(row.partition("\t")[::2] for row in rows or [])
-        b, a = by_name(before["untracked"]), by_name(after["untracked"])
+        b, a = _untracked_map(before["untracked"]), _untracked_map(after["untracked"])
         if any(name not in a or a[name] != meta for name, meta in b.items()):
             dims.append("untracked")
     return dims
@@ -703,15 +750,34 @@ def tampered_dimensions(before: dict, after: dict) -> list[str]:
 # 不能只是某条命令的参数。第一版漏了这一层，于是 reviewer 自己实测出误判：
 # `rg -n apply_patch rloop.py` —— 一条纯检索命令 —— 被当成了动手证据。搜自己的
 # 源码里有没有某个词，是评审时最正常不过的动作。
+#
+# git 那一支还得再细分：`git apply --check`、`git stash list`、`git commit --dry-run`
+# 都是**只读**的，只看子命令名会把它们连坐进来。这条也是实测出来的误判。
 _CMD_POS = r"(?:^|[;&|]\s*|\b(?:ba|z)?sh\s+-lc\s+[\"']?)"
 WRITE_EVIDENCE_RE = re.compile(
     _CMD_POS + r"(?:apply_patch\b"
     r"|sed\s+-i\b"
     r"|patch\s+-p\d"
-    r"|git\s+(?:commit|apply|am|revert|restore|stash|reset)\b"
-    r"|git\s+checkout\s+--)"
+    r"|git\s+(?:commit|am|revert|restore|reset)\b"
+    r"|git\s+apply\b"
+    r"|git\s+stash\s+(?:push|save|pop|apply|drop|clear|create\s+-)"
+    r"|git\s+stash\s*$"
+    r"|git\s+checkout\s+--"
+    # 项目自带的工具链改起代码来一样是改代码，而且这不是「刻意规避」，是日常操作：
+    # reviewer 顺手跑个 formatter 就能把被审代码重写一遍。带 --check / --dry-run 的
+    # 那些由 _DRYRUN_RE 排掉。
+    r"|ruff\s+[^|;&]*--fix"
+    r"|(?:gofmt|goimports)\s+[^|;&]*-w\b"
+    r"|(?:black|isort|autopep8|yapf|clang-format|rustfmt|cargo\s+fmt|dart\s+format)\b"
+    r"|prettier\s+[^|;&]*--write"
+    r"|(?:npm|pnpm|yarn)\s+run\s+\S*(?:fix|format)"
+    r"|eslint\s+[^|;&]*--fix)"
     r"|>>?\s*\S*\.(?:py|js|jsx|ts|tsx|go|rs|java|rb|c|h|cc|cpp|swift|kt|php|sh|sql"
     r"|toml|cfg|ini|gradle)\b")
+
+# 这些 flag 一出现，那条 git 命令就什么都不会改。放在正则之外单独判，是因为
+# 「命令里出现了 --dry-run」这件事跟它匹配到哪一支无关。
+_DRYRUN_RE = re.compile(r"--(?:dry-run|check|stat|numstat|summary|help)\b|\s-h\b")
 
 # 临时目录的痕迹。reviewer **应该**在 /tmp 里建临时仓库复现 finding —— 前几轮它
 # 正是这么干的，`cd /tmp/probe && git commit -am probe` 是评审动作而不是越界。
@@ -720,14 +786,23 @@ WRITE_EVIDENCE_RE = re.compile(
 _TMPWORK_RE = re.compile(r"\bmktemp\b|\bmkdtemp\b|\btempfile\b|\bTemporaryDirectory\b|\btmp_path\b")
 
 
+def _outside_project(path: str, project: Path | None) -> bool:
+    root = str(project) if project else None
+    return not root or not (path == root or path.startswith(root + "/"))
+
+
 def _leaves_the_project(cmd: str, project: Path | None) -> bool:
-    """这条命令把自己挪到项目外去了吗。"""
+    """这条命令写的是项目外的东西吗。"""
     if _TMPWORK_RE.search(cmd):
         return True
-    root = str(project) if project else None
+    # 切到项目外的目录去操作
     for m in re.finditer(r"\b(?:cd|git\s+-C|pushd)\s+([\"']?)(/[^\s\"';&|]+)\1", cmd):
-        target = m.group(2)
-        if not root or not (target == root or target.startswith(root + "/")):
+        if _outside_project(m.group(2), project):
+            return True
+    # 重定向到项目外的绝对路径。`echo x > /tmp/probe/foo.py` 一样是 reviewer 复现
+    # 问题的常规动作 —— 它没有 cd、也没提 mktemp，光看前一条规则漏得干干净净。
+    for m in re.finditer(r">>?\s*([\"']?)(/[^\s\"';&|]+)\1", cmd):
+        if _outside_project(m.group(2), project):
             return True
     return False
 
@@ -764,7 +839,9 @@ def reviewer_write_evidence(log_file: Path, project: Path | None = None) -> list
             continue
         if item.get("type") == "command_execution" and ev.get("type") == "item.completed":
             cmd = item.get("command") or ""
-            if WRITE_EVIDENCE_RE.search(cmd) and not _leaves_the_project(cmd, project):
+            if (WRITE_EVIDENCE_RE.search(cmd)
+                    and not _DRYRUN_RE.search(cmd)
+                    and not _leaves_the_project(cmd, project)):
                 hits.append(cmd[:200])
     return hits
 
@@ -776,8 +853,8 @@ def new_paths(before: dict, after: dict) -> list[str]:
     不说：未跟踪文件**会进下一轮的送审范围**，不点名的话作者会在下一轮看见一堆
     自己没写过的"改动"。
     """
-    old = {row.partition("\t")[0] for row in before.get("untracked") or []}
-    return sorted({row.partition("\t")[0] for row in after.get("untracked") or []} - old)
+    old = set(_untracked_map(before.get("untracked")))
+    return sorted(set(_untracked_map(after.get("untracked"))) - old)
 
 
 def reviewer_permission_note(agent: str, verify: bool) -> str:
@@ -796,6 +873,10 @@ def reviewer_permission_note(agent: str, verify: bool) -> str:
 findings 由作者去处理。那些非写不可的工具（pytest 的缓存、构建产物）会卡在写入上；
 用不需要写的方式跑（比如 `pytest -p no:cacheprovider`），或者如实把结果记成 `fail` /
 `not_run` 并写明原因。
+
+**同一个测试运行器失败两次就别再试了**：换什么参数都绕不过去，每试一次都白费一轮
+本可以用来读代码的机会。这一档下真正管用的是：读源码、`git diff`、`ast.parse`、
+以及直接 import 模块调纯函数（`python3 -c 'import x; ...'`）。
 """
         return """\
 ## 你的权限
@@ -809,6 +890,20 @@ outcome 记 `not_run`，并在 `note` 里说明评审方没有 shell。你的判
     # 后果这句必须按 agent 说实话。codex 那边真会作废（有事件流可查，两个信号齐了
     # 就退 1）；claude 这边扫不到执行记录，作废触发不了 —— 把"会作废"原样说给它，
     # 就是拿一句执行不了的威慑当保险。
+    sandbox_blame = """\
+**先分清失败是谁的错。** 沙箱挡掉的东西会以测试失败的样子出现，那是评审环境的限制，
+不是被审代码的缺陷 —— 拿它开 finding 就是误报。实测撞见过这两类：
+
+- **绑端口 / 起本地服务 / 联网**：`PermissionError: [Errno 1] Operation not permitted`
+  落在 `socket.bind`、或者连接被拒。
+- **看别的进程**：`ps` 之类的输出为空或缺行，于是依赖「进程还活着吗 / 什么时候起的」
+  的用例断在空字符串上。
+
+判断方法很直接：看报错是不是权限、网络、进程可见性这几类，以及**同一个仓库里不碰
+这些的测试是不是全绿**。这类失败在 `validation_commands` 里记 `fail` 并在 `note` 里
+写明是沙箱所致；打分时不因此扣分，但也不能反过来当成「跑通了」。
+
+""" if agent == "codex" else ""
     consequence = ("被改过、而且你的执行记录里留下了动手的痕迹，这一轮会被判为不可信、整轮作废"
                    if agent == "codex" else
                    "被改过的话会记进本轮报告 —— 你这边没有可供核查的执行事件流，所以触发不了\n"
@@ -824,19 +919,7 @@ outcome 记 `not_run`，并在 `note` 里说明评审方没有 shell。你的判
 - 跑完把命令和真实结果填进 `validation_commands`。**跑过的就记 pass/fail，
   别把没跑的记成 not_run 之外的任何值。**
 
-**先分清失败是谁的错。** 沙箱挡掉的东西会以测试失败的样子出现，那是评审环境的限制，
-不是被审代码的缺陷 —— 拿它开 finding 就是误报。实测撞见过这两类：
-
-- **绑端口 / 起本地服务 / 联网**：`PermissionError: [Errno 1] Operation not permitted`
-  落在 `socket.bind`、或者连接被拒。
-- **看别的进程**：`ps` 之类的输出为空或缺行，于是依赖"进程还活着吗 / 什么时候起的"
-  的用例断在空字符串上。
-
-判断方法很直接：看报错是不是权限、网络、进程可见性这几类，以及**同一个仓库里不碰
-这些的测试是不是全绿**。这类失败在 `validation_commands` 里记 `fail` 并在 `note` 里
-写明是沙箱所致；打分时不因此扣分，但也不能反过来当成"跑通了"。
-
-打分那条硬规则**没有变**：真实依赖一次都没跑通过时，`production_readiness` 仍然封顶
+{sandbox_blame}打分那条硬规则**没有变**：真实依赖一次都没跑通过时，`production_readiness` 仍然封顶
 5 分。变的是你现在**有能力自己去确认它到底通没通**，而不是只能记 `not_run` 然后按
 最坏情况估。跑通了就拿着输出给分，跑挂了就如实压分 —— 跑都没跑还给高分，站不住。
 """
@@ -1332,6 +1415,21 @@ def reviewer_cmd(agent: str, project: Path, pack: str, schema_file: Path,
     return cmd + effort_args(agent, effort)
 
 
+def note_incomplete_fingerprint(loop: "Loop", fp: dict, when: str) -> bool:
+    """指纹没拍全就说出来，返回是否完整。
+
+    这条保险是**失败开放**的：git 挂了、或者这儿压根不是仓库时，reviewer 照样
+    拿着写权限跑，只是没人核对它。不吭声的话，「有指纹兜着」会变成一句你以为
+    成立、实际没成立的话。两张快照都要查 —— 只查起跑那张的话，评审期间 git 挂掉
+    会让 after 缺维度，而「缺的键不参与比较」会让它安静地看起来像没变过。
+    """
+    missing = [k for k in FINGERPRINT_KEYS if k not in fp]
+    if missing:
+        loop.log(f"  ! {when}的工作区指纹缺了 {'、'.join(missing)}，"
+                 f"这一轮的越界核对不完整")
+    return not missing
+
+
 def run_reviewer(loop: Loop, rnd: int) -> int:
     s = loop.state
     project = Path(s["project"])
@@ -1353,12 +1451,8 @@ def run_reviewer(loop: Loop, rnd: int) -> int:
     # 放开写权限的那道保险：跑之前拍一张工作区指纹，跑完核对。
     # 只读模式下不用拍 —— 内核已经挡住了。
     before = workspace_fingerprint(project) if verify else {}
-    if verify and len(before) < len(FINGERPRINT_KEYS):
-        # 拍不全就说出来。这条保险是**失败开放**的：git 挂了或者这儿压根不是仓库时，
-        # reviewer 照样拿着写权限跑，只是没人核对它。不吭声的话，"有指纹兜着"
-        # 会变成一句你以为成立、实际没成立的话。
-        loop.log(f"  ! 工作区指纹只拍到 {len(before)}/{len(FINGERPRINT_KEYS)} 个维度"
-                 "，这一轮的越界核对不完整")
+    if verify:
+        note_incomplete_fingerprint(loop, before, "起跑前")
 
     cmd = reviewer_cmd(agent, project, pack, schema_file, rd / "review.json",
                        s.get("reviewer_model"), s.get("reviewer_effort"), verify=verify)
@@ -1368,6 +1462,9 @@ def run_reviewer(loop: Loop, rnd: int) -> int:
 
     if verify:
         after = workspace_fingerprint(project)
+        # 跑完这张也要查完整性。只查起跑那张是不够的：git 在评审期间挂掉、仓库被
+        # 挪走，after 就缺维度，而「缺的键不参与比较」会让它安静地看起来像没变过。
+        note_incomplete_fingerprint(loop, after, "跑完后")
         moved = fingerprint_changed(before, after)
         # 指纹只知道工作区变没变，**不知道是谁变的** —— 这五分钟里你多半也在改自己的
         # 代码，那正是 rloop 支持的用法。所以作废要有第二个信号：reviewer 自己的日志
@@ -1375,6 +1472,10 @@ def run_reviewer(loop: Loop, rnd: int) -> int:
         touched = tampered_dimensions(before, after)
         evidence = reviewer_write_evidence(log_file, project) if touched else []
         if touched and evidence:
+            # 落进账本，报告里才看得到。给 claude 的 prompt 就是拿「会记进本轮报告」
+            # 当约束的（那条路径触发不了作废），不写下来那句话又是空的。
+            loop.update(fingerprint_note=f"**这一轮作废**：reviewer 动了被审的代码"
+                                         f"（{'、'.join(touched)}）；证据：`{evidence[0][:160]}`")
             loop.log(f"  ! reviewer 动了被审的代码（{'、'.join(touched)}）—— 这一轮作废")
             loop.log(f"    证据：{evidence[0][:100]}")
             loop.log("    它只该评审不该动手。用 --no-verify 把它关回只读再跑。")
@@ -1382,19 +1483,28 @@ def run_reviewer(loop: Loop, rnd: int) -> int:
                                {"changed": moved, "evidence": evidence[:5]})
             return EXIT_ERROR
         if touched:
+            loop.update(fingerprint_note=f"工作区在评审期间变过（{'、'.join(touched)}），"
+                                         f"reviewer 日志里没有动手痕迹 —— 结果照留")
             loop.log(f"  ! 工作区在评审期间变过（{'、'.join(touched)}）")
-            # 这里不能说"它看的是起跑那一刻的快照" —— reviewer 直接跑在工作区上，
+            # 这里不能说「它看的是起跑那一刻的快照」—— reviewer 直接跑在工作区上，
             # 读的是实时文件。补丁是起跑时定的，文件却可能是你刚改过的，两边对不上。
             loop.log("    reviewer 的日志里没有动手的痕迹，多半是你自己在改 —— 结果照留，"
                      "但它读的是实时文件，本轮判断可能落在改前改后的混合状态上。")
             loop.progress.emit("note", "工作区在评审期间变过", "warn", {"changed": moved})
+        elif "status" in moved:
+            # git 索引动了但文件内容没动 —— `git add` / `git rm --cached` 这类。
+            # prompt 里明写着「动 git 状态 —— 不行」，那就不能一声不吭。
+            loop.log("  ! git 索引在评审期间变过（暂存状态），文件内容没动")
         # 多出来的未跟踪文件单独说 —— 跑测试掉产物是常态，够不上作废，但它们**会进
         # 下一轮的送审范围**，不点名的话下一轮你会看见一堆自己没写过的"改动"。
         added = new_paths(before, after) if moved else []
         if added:
             loop.log(f"  ! reviewer 跑完后工作区多了 {len(added)} 个未跟踪文件"
                      f"（{'、'.join(added[:5])}{' …' if len(added) > 5 else ''}）")
-            loop.log("    这些文件会进下一轮的送审范围，该 gitignore 的记得加上。")
+            # 范围钉死在历史提交上时根本没有「下一轮的送审范围」这回事。
+            loop.log("    这些文件会进下一轮的送审范围，该 gitignore 的记得加上。"
+                     if s.get("diff_target") is None else
+                     "    范围钉在历史提交上，它们进不了送审 diff，但会留在你的工作区里。")
             # 用现成的 note kind，不为这件事往对外契约里加第十四种 kind。
             loop.progress.emit("note", f"工作区多了 {len(added)} 个未跟踪文件", "warn",
                                {"added": added[:20]})
@@ -1713,6 +1823,11 @@ def detect_stall(history: list) -> bool:
 # ─────────────────────────── 报告与通知 ───────────────────────────
 
 
+def fingerprint_note(s: dict) -> str:
+    """报告抬头里那句「这个 reviewer 当时是什么档位」。"""
+    return "能跑测试，不能改代码" if s.get("verify", True) else "只读子进程"
+
+
 def render_report(loop: Loop) -> str:
     s = loop.state
     lines = [
@@ -1721,7 +1836,8 @@ def render_report(loop: Loop) -> str:
         f"- 项目：`{s['project']}`",
         f"- 范围：{s['scope_desc']}",
         *([f"- 侧重：{s['focus']}"] if s.get("focus") else []),
-        f"- 审阅：**{s['reviewer']}**（只读子进程）；改动由调用方的开发会话完成",
+        f"- 审阅：**{s['reviewer']}**（{fingerprint_note(s)}）；改动由调用方的开发会话完成",
+        *([f"- 工作区核对：{s['fingerprint_note']}"] if s.get("fingerprint_note") else []),
         f"- 结果：**{s.get('outcome', '进行中')}**（{s.get('outcome_reason', '')}）",
         f"- 轮次：{s.get('round', 0)} / {s['max_rounds']}，阈值 {s['min_score']}",
         "",
@@ -2090,6 +2206,18 @@ def cmd_review(args) -> int:
             if given is not None and given != s.get(key):
                 loop.update(**{key: given})
                 loop.log(f"  {label}改为 {given}")
+
+        # `--no-verify` 续轮时也得算数。它先前只在新建 loop 的分支里读，于是
+        # 「loop 开着的时候改主意想收紧权限」这条路上，开关是一句静默失效的咒语：
+        # loop.json 里 verify 还是 true，reviewer 照旧拿 workspace-write 起跑，
+        # 终端上一个字都不说。**只认收紧这一个方向** —— store_true 分不出「没给」
+        # 和「给了 false」，而放开权限绝不能靠一个分不清的默认值推断出来。想从
+        # 只读改回放开，用 --new 另起一个 loop。
+        if args.no_verify and s.get("verify", True):
+            loop.update(verify=False)
+            loop.log("  reviewer 关回只读（--no-verify）")
+            s = loop.state
+
         prev_resp = loop.round_path(s["round"]) / "response.md"
         if not prev_resp.exists():
             loop.log(f"  ! 上一轮没有 {prev_resp.name}，reviewer 将无从判断你做了什么，"
@@ -2254,6 +2382,12 @@ def run_one_round(loop: Loop) -> int:
     loop.log(f"  reviewer ({s['reviewer']}) 开始评审…")
     rc = run_reviewer(loop, rnd)
     if rc != 0:
+        # 作废和「reviewer 自己崩了」都走这条路，但两者对调用方的含义完全不同 ——
+        # 账本里只留一句 "reviewer exit 1" 的话，事后没人分得清这一轮是怎么没的。
+        note = loop.state.get("fingerprint_note") or ""
+        if note.startswith("**这一轮作废**"):
+            loop.log("  ! 本轮作废：reviewer 动了被审的代码")
+            return finish(loop, "failed", "reviewer 改动了被审代码，本轮判定不可信", EXIT_ERROR)
         loop.log(f"  ! reviewer 失败（退出码 {rc}）")
         return finish(loop, "failed", f"reviewer exit {rc}", EXIT_ERROR)
 
@@ -3066,6 +3200,9 @@ def loop_summary(loop: Loop, state: dict | None = None,
         "reviewer": st.get("reviewer"),
         "reviewer_model": st.get("reviewer_model"),
         "reviewer_effort": st.get("reviewer_effort"),
+        # 面板得知道这一轮 reviewer 是哪一档，否则「codex」这三个字底下藏着
+        # 「能跑测试」还是「只读」全看不出来。
+        "verify": bool(st.get("verify", True)),
         "deliverable": last.get("deliverable_maturity"),
         "production": last.get("production_readiness"),
         "blocking": last.get("blocking_findings"),

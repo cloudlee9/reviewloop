@@ -994,15 +994,141 @@ def test_editing_your_own_code_during_a_review_is_not_blamed_on_the_reviewer(tmp
     assert rloop.reviewer_write_evidence(tmp_path / "根本没有这个文件") == []
 
 
+def test_an_incomplete_fingerprint_is_announced(tmp_path):
+    """指纹这道保险失败开放 —— 那就必须说出口，两张快照都要说。
+
+    变异测试发现：把这条提醒整个删掉，全套测试照样绿。也就是说「拍不全会告诉你」
+    先前只是一句没人守的承诺。
+    """
+    loop = make_loop(tmp_path)
+    loop.root.mkdir(parents=True, exist_ok=True)   # make_loop 只拼路径不建目录
+
+    full = {k: "x" for k in rloop.FINGERPRINT_KEYS}
+    assert rloop.note_incomplete_fingerprint(loop, full, "起跑前") is True
+
+    partial = {"head": "abc"}
+    assert rloop.note_incomplete_fingerprint(loop, partial, "跑完后") is False
+    log = (loop.root / "loop.log").read_text("utf-8")
+    assert "跑完后" in log and "不完整" in log
+    for missing in ("status", "diff", "untracked"):
+        assert missing in log, f"没点名缺了哪一维：{missing}"
+
+
+def test_codex_patch_events_count_as_evidence_whatever_they_are_called(tmp_path):
+    """codex 用自己的工具改文件时不经过 shell，只留一个事件。
+
+    变异测试发现：把 patch_apply 这一支删掉，测试不红 —— 当时只有 file_change
+    被覆盖着。两个名字都得认，认漏了就等于放过一整类动手方式。
+    """
+    log = tmp_path / "reviewer.log"
+    for kind in ("file_change", "patch_apply"):
+        log.write_text(json.dumps({"type": "item.completed",
+                                   "item": {"type": kind, "path": "rloop.py"}}),
+                       encoding="utf-8")
+        hits = rloop.reviewer_write_evidence(log, tmp_path / "proj")
+        assert hits and kind in hits[0], f"{kind} 事件没被当成证据"
+
+
+def test_formatters_that_rewrite_code_count_as_tampering(tmp_path):
+    """`ruff --fix` / `gofmt -w` 改起被审代码来和 sed -i 没有区别。
+
+    这不是「刻意规避检测」那一类 —— reviewer 顺手跑个 formatter 想看看代码风格，
+    就能把被审代码重写一遍，而先前的检测只认几个命令名，一个都抓不到。
+    带 --check / --dry-run 的那些不算，它们不写盘。
+    """
+    log = tmp_path / "reviewer.log"
+    proj = tmp_path / "proj"
+
+    def ev(cmd):
+        return json.dumps({"type": "item.completed",
+                           "item": {"type": "command_execution", "command": cmd}},
+                          ensure_ascii=False)
+
+    for cmd in ("/bin/zsh -lc 'ruff check --fix .'",
+                "/bin/zsh -lc 'gofmt -w ./...'",
+                "/bin/zsh -lc 'black .'",
+                "/bin/zsh -lc 'eslint --fix src/'",
+                "/bin/zsh -lc 'npm run lint:fix'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log, proj), f"改代码的工具没被认出来：{cmd}"
+
+    for cmd in ("/bin/zsh -lc 'ruff check .'",
+                "/bin/zsh -lc 'gofmt -l ./...'",
+                "/bin/zsh -lc 'black --check .'",
+                "/bin/zsh -lc 'npm run lint'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log, proj) == [], f"只查不改被判成动手：{cmd}"
+
+
+def test_read_only_git_commands_are_not_tampering_evidence(tmp_path):
+    """自审抓到的第三种误判。
+
+    `git apply --check` 是校验补丁能不能打、`git stash list` 是列表、
+    `git commit --dry-run` 什么都不做 —— 全是只读动作。只按子命令名匹配会把它们
+    连坐进来，而命中的后果是整轮作废：作者只要恰好在这五分钟里改了自己的代码，
+    两个互不相干的信号就凑成一次误杀。
+    """
+    log = tmp_path / "reviewer.log"
+    proj = tmp_path / "proj"
+
+    def ev(cmd):
+        return json.dumps({"type": "item.completed",
+                           "item": {"type": "command_execution", "command": cmd}},
+                          ensure_ascii=False)
+
+    for cmd in ("/bin/zsh -lc 'git apply --check /tmp/p.diff'",
+                "/bin/zsh -lc 'git apply --stat d.patch'",
+                "/bin/zsh -lc 'git stash list'",
+                "/bin/zsh -lc 'git commit --dry-run'",
+                "/bin/zsh -lc 'git reset --help'",
+                "/bin/zsh -lc 'git diff --stat && git status --short'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log, proj) == [], f"只读 git 被判成动手：{cmd}"
+
+    # 同一批子命令真去写的时候必须照抓
+    for cmd in ("/bin/zsh -lc 'git apply /tmp/p.diff'",
+                "/bin/zsh -lc 'git stash push -u'",
+                "/bin/zsh -lc 'git commit -am wip'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log, proj), f"没认出动手证据：{cmd}"
+
+
+def test_writing_to_a_temp_path_is_not_tampering_evidence(tmp_path):
+    """`echo x > /tmp/probe/foo.py` 没有 cd、也没提 mktemp —— 光看"切没切目录"漏得干净。
+
+    这同样是 reviewer 复现问题时的常规动作，同样会凑成误作废。
+    """
+    log = tmp_path / "reviewer.log"
+    proj = tmp_path / "proj"
+
+    def ev(cmd):
+        return json.dumps({"type": "item.completed",
+                           "item": {"type": "command_execution", "command": cmd}},
+                          ensure_ascii=False)
+
+    for cmd in ("/bin/zsh -lc 'echo x > /tmp/probe/foo.py'",
+                "/bin/zsh -lc 'cat > /private/var/folders/ab/t.py <<EOF'",
+                f"/bin/zsh -lc 'echo x > {tmp_path}/elsewhere/other.py'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log, proj) == [], f"项目外的写被判成动手：{cmd}"
+
+    # 项目自己的文件照抓
+    log.write_text(ev(f"/bin/zsh -lc 'echo x > {proj}/a.py'"), encoding="utf-8")
+    assert rloop.reviewer_write_evidence(log, proj), "项目内的写被放过了"
+
+
 def test_test_droppings_are_named_not_treated_as_tampering():
     """跑测试必然掉产物；把那个当成"改了代码"，放开写权限这件事就白做了。
 
     但只是"多出文件"才不算 —— 未跟踪文件会进下一轮的送审范围，所以要点名。
     """
+    # 未跟踪指纹行的格式是 `size\tdigest\t路径` —— 摘要在前、路径在后，因为路径里
+    # 可能带 TAB，放前面会让解析从文件名中间断开。
     base = {"status": [" M a.py"], "head": "abc", "diff": "h1",
-            "untracked": ["notes.md\t10\t111"]}
+            "untracked": ["10\tsha-notes\tnotes.md"]}
     after = {**base, "status": [" M a.py", "?? out.log"],
-             "untracked": ["notes.md\t10\t111", ".pytest_cache/v/x\t3\t222", "out.log\t9\t333"]}
+             "untracked": ["10\tsha-notes\tnotes.md", "3\tsha-cache\t.pytest_cache/v/x",
+                           "9\tsha-out\tout.log"]}
 
     assert rloop.tampered_dimensions(base, after) == [], "多出文件被判成了改代码"
     assert rloop.fingerprint_changed(base, after) == ["status", "untracked"]
@@ -1020,8 +1146,8 @@ def test_editing_an_untracked_file_counts_as_touching_the_code():
     全静止。所以指纹必须单独记未跟踪文件的大小和 mtime。
     """
     base = {"status": ["?? new.py"], "head": "abc", "diff": "h1",
-            "untracked": ["new.py\t120\t111"]}
-    edited = {**base, "untracked": ["new.py\t180\t222"]}
+            "untracked": ["120\tsha-old\tnew.py"]}
+    edited = {**base, "untracked": ["180\tsha-new\tnew.py"]}
 
     assert rloop.tampered_dimensions(base, edited) == ["untracked"], "改未跟踪源码没被抓到"
     assert rloop.fingerprint_changed(base, edited) == ["untracked"]
@@ -1033,7 +1159,7 @@ def test_editing_an_untracked_file_counts_as_touching_the_code():
 
     # 判据是"基线里的条目还在不在、变没变"，所以 reviewer 自己生成又删掉的临时文件
     # 两张快照都看不见，不会牵连到它
-    kept = {**base, "untracked": ["new.py\t120\t111", "build/out.o\t99\t333"]}
+    kept = {**base, "untracked": ["120\tsha-old\tnew.py", "99\tsha-obj\tbuild/out.o"]}
     assert rloop.tampered_dimensions(base, kept) == []
 
 

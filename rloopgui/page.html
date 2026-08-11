@@ -325,7 +325,8 @@ function resultView(l,rv,d){
     <dt>范围</dt><dd>${esc(l.scope)}</dd>
     ${l.focus?`<dt>侧重</dt><dd>${esc(l.focus)}</dd>`:""}
     <dt>reviewer</dt><dd>${esc(l.reviewer)}${l.reviewer_model?" / "+esc(l.reviewer_model):""}
-      ${l.reviewer_effort?`<span class="pill">${esc(l.reviewer_effort)}</span>`:""}</dd>
+      ${l.reviewer_effort?`<span class="pill">${esc(l.reviewer_effort)}</span>`:""}
+      <span class="pill">${l.verify===false?"只读":"能跑测试"}</span></dd>
     <dt>目录</dt><dd class="loc">${esc(l.root)}</dd>
   </dl>`;
 

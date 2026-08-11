@@ -60,6 +60,10 @@ if tamper:
     t = pathlib.Path(tamper)
     t.write_text(t.read_text("utf-8") + "# reviewer 动的手\\n", encoding="utf-8")
 
+drop = os.environ.get("FAKE_DROP")           # 扮演跑测试掉了个产物的 reviewer
+if drop:
+    pathlib.Path(drop).write_text("测试产物\\n", encoding="utf-8")
+
 if "-o" in argv:                       # codex：自己写 -o 指定的文件
     pathlib.Path(argv[argv.index("-o") + 1]).write_text(payload, encoding="utf-8")
     print("fake reviewer: wrote review file")
@@ -711,6 +715,42 @@ def test_a_reviewer_caught_editing_the_code_voids_the_round(tmp_path):
     assert "作废" in log and "--no-verify" in log, "没告诉人怎么把它关回只读"
 
 
+def test_droppings_left_behind_are_named_in_the_log(tmp_path):
+    """变异测试发现这条提醒没人守：删掉它全套测试照样绿。
+
+    它要紧是因为未跟踪文件**会进下一轮的送审范围** —— 不点名的话，下一轮作者会
+    在补丁里看见一堆自己没写过的"改动"。
+    """
+    h = Harness(tmp_path / "drop", [review()])
+    h.env["FAKE_DROP"] = str(h.project / "leftover.log")
+    r = h.run()
+
+    assert r.rc == rloop.EXIT_NEEDS_WORK, "掉个产物不该影响判定"
+    log = (r.loop.root / "loop.log").read_text("utf-8")
+    assert "未跟踪文件" in log and "leftover.log" in log, f"多出来的文件没被点名：\n{log[-600:]}"
+
+
+def test_a_void_says_so_in_the_ledger_and_the_report(tmp_path):
+    """作废和「reviewer 自己崩了」都退 1，但对调用方是两回事。
+
+    账本里只留一句 `reviewer exit 1` 的话，事后没人分得清这一轮是怎么没的；
+    而给 claude 的 prompt 正是拿「会记进本轮报告」当约束的 —— 报告里不写，
+    那句话就是空的。
+    """
+    h = Harness(tmp_path / "void", [review()])
+    h.env["FAKE_TAMPER"] = str(h.project / "app.py")
+    h.env["FAKE_EVENTS"] = json.dumps(
+        [{"type": "item.completed", "item": {"type": "file_change", "path": "app.py"}}])
+    r = h.run()
+
+    assert r.rc == rloop.EXIT_ERROR
+    assert "exit" not in (r.state.get("outcome_reason") or ""), \
+        f"作废被记成了普通的 reviewer 崩溃：{r.state.get('outcome_reason')}"
+    assert "改动了被审代码" in r.state["outcome_reason"]
+    assert "作废" in (r.state.get("fingerprint_note") or ""), "指纹裁决没落进账本"
+    assert "作废" in rloop.render_report(r.loop), "报告里看不到工作区核对的结果"
+
+
 def test_the_author_editing_during_the_round_does_not_void_it(tmp_path):
     """回归用例，来自第一次实跑时的误判。
 
@@ -735,6 +775,28 @@ def test_no_verify_puts_the_codex_reviewer_back_behind_read_only(tmp_path):
 
     assert argv[0] == "-s" and argv[1] == "read-only", f"--no-verify 没关掉写权限：{argv[:4]}"
     assert r.loop.state["verify"] is False, "loop.json 没记下这一档，续跑会悄悄变回放开"
+
+
+def test_no_verify_takes_effect_on_a_resumed_loop_too(tmp_path):
+    """自审抓到的最硬一条：`--no-verify` 在续轮时是一句静默失效的咒语。
+
+    verify 先前只在**新建 loop** 的分支里读一次。于是「loop 还开着的时候改主意想
+    收紧权限」这条路上，开关落不进 loop.json，reviewer 照旧拿 workspace-write
+    起跑，终端上一个字都不说 —— 用户以为自己关掉了写权限，其实一直开着。
+    """
+    h = Harness(tmp_path / "resume", [review(), review()])
+    r1 = h.run()
+    assert r1.state["verify"] is True and r1.calls[-1]["argv"][1] == "workspace-write"
+
+    h.write_response(r1.loop, 1)
+    h.author_edits()
+    r2 = h.run("--no-verify")
+
+    assert len(r2.loops) == 1, "前提：这确实是续轮，不是另起了一个 loop"
+    assert r2.state["verify"] is False, "--no-verify 没落进 loop.json"
+    assert r2.calls[-1]["argv"][1] == "read-only", "沙箱没关回只读"
+    log = (r2.loop.root / "loop.log").read_text("utf-8")
+    assert "关回只读" in log, "档位变了却一声不吭"
 
 
 def test_claude_reviewer_gets_write_tools_but_never_the_skip_flag(tmp_path):

@@ -122,6 +122,9 @@ rloop web
   `validation_commands` 会如实标 `not_run`。
 - **跑测试会掉产物。** 没进 `.gitignore` 的那些会被指纹看见，rloop 点名提醒但不作废；
   要留意它们会进下一轮的送审范围。
+- **作废只在 codex 一侧真的会发生。** 判定要两个信号：工作区指纹变了，**并且**
+  reviewer 自己的执行记录里有动手痕迹。痕迹来自 codex 的事件流，claude 那边没有
+  等价的东西可扫，所以 claude 当 reviewer 时只会记进报告、不会作废。
 - **只有 codex 有细粒度进度。** reviewer 是 claude 时，面板上看不到它执行的每条
   命令（claude 不吐那种事件流），只有轮次开始/评分/结束几个节点。`rloop api meta`
   里如实声明了这一点。
