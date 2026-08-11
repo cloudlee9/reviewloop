@@ -55,6 +55,11 @@ payload = json.dumps(reviews[min(n, len(reviews) - 1)], ensure_ascii=False)
 for ev in json.loads(os.environ.get("FAKE_EVENTS", "[]")):
     print(json.dumps(ev, ensure_ascii=False), flush=True)
 
+tamper = os.environ.get("FAKE_TAMPER")       # 扮演一个动手改了被审代码的 reviewer
+if tamper:
+    t = pathlib.Path(tamper)
+    t.write_text(t.read_text("utf-8") + "# reviewer 动的手\\n", encoding="utf-8")
+
 if "-o" in argv:                       # codex：自己写 -o 指定的文件
     pathlib.Path(argv[argv.index("-o") + 1]).write_text(payload, encoding="utf-8")
     print("fake reviewer: wrote review file")
@@ -116,6 +121,7 @@ class Harness:
 
     def __init__(self, tmp_path: Path, reviews: list, project: Path | None = None):
         self.tmp = tmp_path
+        tmp_path.mkdir(parents=True, exist_ok=True)   # 允许传 tmp_path 的子目录，好在一条测试里开两个互不干扰的 harness
         self.project = project or make_project(tmp_path)
         fakebin = tmp_path / "fakebin"
         fakebin.mkdir(exist_ok=True)
@@ -663,32 +669,97 @@ def test_garbage_review_is_an_error_not_a_pass(tmp_path):
 # ─────────────────────────── reviewer 的命令行 ───────────────────────────
 
 
-def test_codex_reviewer_is_read_only_and_leaves_no_session(tmp_path):
+def test_codex_reviewer_is_opened_up_only_as_far_as_running_tests_needs(tmp_path):
+    """默认放开到 workspace-write —— 再往上就没有沙箱了。
+
+    reviewer 读的是可能被污染的代码，所以「够它跑测试」和「全权限」之间那条线
+    要钉在 argv 上：workspace-write 让它跑得动 pytest、写得了临时文件，而内核仍然
+    挡着 HOME；danger-full-access 或 --dangerously-bypass-* 一旦漏进来，仓库里
+    一句提示注入就能落到这台机器上。
+
+    沙箱和工作目录是 codex 的**全局**选项，必须排在子命令之前 —— 放到 `exec`
+    后面 codex 会报 unexpected argument，那时沙箱不是变松了而是根本没起来。
+    """
     r = Harness(tmp_path, [review()]).run()
     argv = r.calls[0]["argv"]
 
-    # 沙箱和工作目录是 codex 的**全局**选项，排在子命令之前。实测过它确实是
-    # 开关而不是摆设：带 -s read-only 时子进程写文件被拒，不带时写得进去。
-    # 这一条断言的是真正交给子进程的 argv。
-    assert argv[0] == "-s" and argv[1] == "read-only", f"沙箱不在最前：{argv[:4]}"
+    assert argv[0] == "-s" and argv[1] == "workspace-write", f"沙箱不在最前：{argv[:4]}"
     assert "exec" in argv and argv.index("-s") < argv.index("exec"), \
         f"沙箱排到了子命令后面：{argv[:6]}"
     assert "-C" in argv and argv.index("-C") < argv.index("exec")
     assert "--output-schema" in argv, "没有 schema，模型可以自由发挥"
     assert "--ephemeral" in argv
+    assert "danger-full-access" not in argv, "放开过头了"
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv, "reviewer 拿到了全权限"
     assert "--dangerously-bypass-hook-trust" not in argv, "替仓库绕过了 hook trust"
 
 
-def test_claude_reviewer_runs_in_plan_mode_with_customizations_off(tmp_path):
-    r = Harness(tmp_path, [review()]).run("--reviewer", "claude")
+def test_a_reviewer_caught_editing_the_code_voids_the_round(tmp_path):
+    """指纹动了 **且** 它自己的日志里有动手痕迹 —— 两个信号齐了才作废。
+
+    作废的理由不是洁癖：这一轮的判断建立在一份 reviewer 自己动过的代码上，
+    "把测试改绿了"和"代码本来就对"在结果里长得一模一样。
+    """
+    h = Harness(tmp_path / "tamper", [review()])
+    h.env["FAKE_TAMPER"] = str(h.project / "app.py")
+    h.env["FAKE_EVENTS"] = json.dumps(
+        [{"type": "item.completed", "item": {"type": "file_change", "path": "app.py"}}])
+    r = h.run()
+
+    assert r.rc == rloop.EXIT_ERROR, f"改了被审代码却没作废（退出码 {r.rc}）"
+    log = (r.loop.root / "loop.log").read_text("utf-8")
+    assert "作废" in log and "--no-verify" in log, "没告诉人怎么把它关回只读"
+
+
+def test_the_author_editing_during_the_round_does_not_void_it(tmp_path):
+    """回归用例，来自第一次实跑时的误判。
+
+    评审要跑好几分钟，作者在这期间接着改自己的代码是 rloop 的正常用法。第一版
+    只看指纹，于是 303 秒的评审连同它跑出来的实证一起被判无效。工作区变了但
+    reviewer 日志里没有动手痕迹时，只提醒，不作废。
+    """
+    h = Harness(tmp_path / "author", [review()])
+    h.env["FAKE_TAMPER"] = str(h.project / "app.py")     # 没有事件证据 = 看着就像作者改的
+    r = h.run()
+
+    assert r.rc == rloop.EXIT_NEEDS_WORK, f"作者自己改了代码就被判成 reviewer 越界（{r.rc}）"
+    assert r.state["history"][-1]["deliverable_maturity"] == 5.0, "评审结果没留下来"
+    log = (r.loop.root / "loop.log").read_text("utf-8")
+    assert "工作区在评审期间变过" in log and "作废" not in log
+
+
+def test_no_verify_puts_the_codex_reviewer_back_behind_read_only(tmp_path):
+    """`--no-verify` 是不信任送审代码时用的，它必须真落到沙箱档位上。"""
+    r = Harness(tmp_path / "ro", [review()]).run("--no-verify")
     argv = r.calls[0]["argv"]
 
-    assert "--permission-mode" in argv and argv[argv.index("--permission-mode") + 1] == "plan"
-    assert "--safe-mode" in argv, "没关掉仓库定制，hook 仍可在 plan 模式下执行"
+    assert argv[0] == "-s" and argv[1] == "read-only", f"--no-verify 没关掉写权限：{argv[:4]}"
+    assert r.loop.state["verify"] is False, "loop.json 没记下这一档，续跑会悄悄变回放开"
+
+
+def test_claude_reviewer_gets_write_tools_but_never_the_skip_flag(tmp_path):
+    """claude 这边没有操作系统沙箱，唯一的边界就是 permission-mode。
+
+    所以两头都要钉：放开时给的是 auto，不是 --dangerously-skip-permissions；
+    仓库定制无论哪档都关着 —— hook 在模型说第一句话之前就跑掉了，permission-mode
+    管不着它。
+    """
+    r = Harness(tmp_path / "rw", [review()]).run("--reviewer", "claude")
+    argv = r.calls[0]["argv"]
+
+    # `auto` 是实测出来的唯一能跑 shell 的档：acceptEdits 和 dontAsk 只自动批准
+    # 文件编辑，Bash 仍要人点头，而 -p 模式下没人可问 —— reviewer 会以为自己能跑，
+    # 然后在 validation_commands 里写满「被权限层拒绝」。
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
+    assert "--safe-mode" in argv, "没关掉仓库定制，hook 仍可绕过 permission-mode 执行"
     assert "--no-session-persistence" in argv
     assert "--json-schema" in argv, "结果没走结构化 stdout，等于还需要写权限"
     assert "--dangerously-skip-permissions" not in argv
+
+    plan = Harness(tmp_path / "plan", [review()]).run("--reviewer", "claude", "--no-verify")
+    ro = plan.calls[0]["argv"]
+    assert ro[ro.index("--permission-mode") + 1] == "plan"
+    assert "--safe-mode" in ro
 
 
 def test_model_and_effort_reach_the_reviewer(tmp_path):

@@ -7,7 +7,7 @@ description: 用另一个模型独立审当前工作区的改动，然后在本�
 
 ## 分工
 
-**`rloop`（app）没有上下文，只干机械活**：起一个无头、无状态、只读的 reviewer 子进程，算 diff 范围，管账本，出结构化 findings，展示面板。**它从不改用户的代码，也不做循环。**
+**`rloop`（app）没有上下文，只干机械活**：起一个无头、无状态的 reviewer 子进程（默认放开到能跑测试，但绝不改用户的代码——跑完核对工作区指纹，被动过就整轮作废；`--no-verify` 关回只读），算 diff 范围，管账本，出结构化 findings，展示面板。**它从不改用户的代码，也不做循环。**
 
 **你（这个会话）有上下文** —— 知道这些代码为什么写成现在这样、之前讨论过什么、哪些是刚改的。所以循环由你驱动，findings 由你处理，回应由你写。
 
@@ -118,6 +118,7 @@ rloop --json $R 重点看并发安全     # 给 reviewer 一个侧重点
 rloop --json $R --effort xhigh    # 拉高推理档位，贵但挖得深很多
 rloop --json $R --new             # 强制开新 loop
 rloop --json $R --label "GUI 切分" # 给这个 loop 起个名字，列表里好认
+rloop --json $R --no-verify        # 把 reviewer 关回只读：审来路不明的代码时用，代价是它拿不到实证
 rloop status / report / replay N  # 走势 / 报告 / 回看第 N 轮的完整输入（不用带 $R）
 ```
 

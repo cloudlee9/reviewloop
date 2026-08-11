@@ -430,14 +430,126 @@ def test_context_pack_tells_the_reviewer_untracked_content_is_inline(tmp_path):
     assert "+x = 1" in (loop.round_dir(1) / "diff.patch").read_text(encoding="utf-8")
 
 
-def test_context_pack_for_claude_reviewer_says_it_has_no_shell(tmp_path):
+def test_the_pack_tells_the_reviewer_what_it_can_actually_do(tmp_path):
+    """权限说明必须和这一轮真实的能力一致。
+
+    说错的代价是具体的：以为自己只读，它就不去跑那些本可以跑的命令，
+    validation_commands 全是 not_run；以为自己能跑，它会声称跑过根本跑不了
+    的东西 —— 那种假证据比没有证据更坏。
+    """
     repo = make_repo(tmp_path)
     head = commit(repo, "c1", **{"a.txt": "base\n"})
     (repo / "a.txt").write_text("base\nmore\n", encoding="utf-8")
-
     loop = make_state_loop(tmp_path, repo, head, None)
-    loop.update(reviewer="claude")
-    pack = rloop.build_context_pack(loop, 1)
 
-    assert "plan 模式" in pack and "执行不了 shell" in pack
-    assert "not_run" in pack
+    for agent in ("claude", "codex"):
+        loop.update(reviewer=agent, verify=False)
+        ro = rloop.build_context_pack(loop, 1)
+        assert "只读" in ro or "执行不了 shell" in ro, f"{agent} 只读模式没说清"
+        assert "not_run" in ro, f"{agent} 没被告知跑不了的命令怎么记"
+
+        loop.update(verify=True)
+        rw = rloop.build_context_pack(loop, 1)
+        assert "绝不能改这个项目的代码" in rw, f"{agent} 放开后没给禁令"
+        assert "封顶" in rw, f"{agent} 没被提醒打分的硬规则没变"
+        # 越界的后果按 agent 说实话：codex 那边真会作废（有事件流可查），claude
+        # 那边扫不到执行记录、触发不了作废，把"会作废"照抄给它就是拿空话当保险。
+        if agent == "codex":
+            assert "整轮作废" in rw
+        else:
+            assert "触发不了" in rw and "整轮作废" not in rw, "对 claude 许了一个执行不了的诺"
+
+
+# ─────────── 工作区指纹（要真的跑 git）───────────
+
+
+def test_the_ledger_is_excluded_from_the_fingerprint(tmp_path):
+    """.review-loops 每轮都在写，把它算进指纹会次次误报。"""
+    import subprocess as sp
+    sp.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    for c in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        sp.run(["git", "-C", str(tmp_path), *c], check=True, capture_output=True)
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
+    sp.run(["git", "-C", str(tmp_path), "commit", "-qm", "i"], check=True, capture_output=True)
+
+    before = rloop.workspace_fingerprint(tmp_path)
+    (tmp_path / rloop.LOOP_DIRNAME).mkdir()
+    (tmp_path / rloop.LOOP_DIRNAME / "loop.json").write_text("{}", encoding="utf-8")
+    assert rloop.fingerprint_changed(before, rloop.workspace_fingerprint(tmp_path)) == [], \
+        "账本目录让指纹误报了"
+
+    (tmp_path / "a.py").write_text("y\n", encoding="utf-8")
+    assert rloop.fingerprint_changed(before, rloop.workspace_fingerprint(tmp_path)), \
+        "真改了源码却没被抓到"
+
+
+def test_an_untracked_file_edited_in_place_still_moves_the_fingerprint(tmp_path):
+    """reviewer 自己证伪的假设（0.4.0 第二轮，medium）。
+
+    未跟踪文件一度只记大小和 mtime，理由是"改内容不可能既不改大小又不动 mtime"。
+    它把同长度的 aaaa 改成 bbbb、再 os.utime 复原时间戳 —— 四个维度全静止。
+    保留时间戳的解包/复制工具也会无意中撞上同一条路。所以那些会内联进送审补丁的
+    未跟踪文件必须算内容哈希。
+    """
+    import os
+
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    target = repo / "new.py"
+    target.write_text("aaaa", encoding="utf-8")
+    before = rloop.workspace_fingerprint(repo)
+    st = target.stat()
+
+    target.write_text("bbbb", encoding="utf-8")          # 同长度
+    os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))  # 时间戳复原
+
+    after = rloop.workspace_fingerprint(repo)
+    assert rloop.fingerprint_changed(before, after) == ["untracked"], "同长度改写没被指纹看见"
+    assert rloop.tampered_dimensions(before, after) == ["untracked"]
+
+
+def test_a_non_repo_cannot_be_fingerprinted_and_that_is_visible(tmp_path):
+    """指纹这道保险是**失败开放**的，所以"拍没拍全"必须能被看出来。
+
+    不是 git 仓库、git 挂了，指纹就拍不全；这时 reviewer 照样带着写权限跑，
+    只是没人核对它。run_reviewer 靠维度数少于 FINGERPRINT_KEYS 判断这件事并
+    在 loop.log 里明说 —— 前提是拍不全时维度数真的会少。
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    fp = rloop.workspace_fingerprint(plain)
+
+    assert len(fp) < len(rloop.FINGERPRINT_KEYS), f"非 git 目录居然拍出了完整指纹：{fp}"
+    assert rloop.fingerprint_changed(fp, rloop.workspace_fingerprint(plain)) == []
+
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n"})
+    assert len(rloop.workspace_fingerprint(repo)) == len(rloop.FINGERPRINT_KEYS), \
+        "正常仓库都拍不全的话，「拍不全」这个信号就没意义了"
+
+
+def test_what_running_tests_leaves_behind_does_not_read_as_tampering(tmp_path):
+    """放开写权限就是为了让 reviewer 跑得动测试，那测试产物不能反过来判它越界。
+
+    两条路各走一遍：被 gitignore 的产物压根不该进指纹；没被 ignore 的会让 status
+    动一下，但 head / diff 不动 —— 那是"多了文件"，不是"改了代码"。
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init", **{"a.py": "x\n", ".gitignore": "__pycache__/\n"})
+    before = rloop.workspace_fingerprint(repo)
+
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "a.pyc").write_bytes(b"\x00")
+    assert rloop.fingerprint_changed(before, rloop.workspace_fingerprint(repo)) == [], \
+        "被 gitignore 的测试产物惊动了指纹"
+
+    (repo / "junk.log").write_text("pytest 写的\n", encoding="utf-8")
+    after = rloop.workspace_fingerprint(repo)
+    assert rloop.fingerprint_changed(before, after) == ["status", "untracked"]
+    assert rloop.tampered_dimensions(before, after) == [], "多出一个日志文件被判成了改代码"
+    assert rloop.new_paths(before, after) == ["junk.log"]
+
+    # 但改这个未跟踪文件的内容就是另一回事了 —— 它会进送审补丁
+    (repo / "junk.log").write_text("被 reviewer 改过\n", encoding="utf-8")
+    assert rloop.tampered_dimensions(after, rloop.workspace_fingerprint(repo)) == ["untracked"]

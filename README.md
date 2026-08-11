@@ -5,7 +5,7 @@
 ```
 你 vibe 完一堆改动
   ↓
-会话跑 rloop --json     →  起一个无头、无状态、只读的 reviewer 子进程
+会话跑 rloop --json     →  起一个无头、无状态的 reviewer 子进程（能跑测试，不改代码）
   ↓                        它给出结构化 findings + 双评分，退出码表达判定
 会话读 findings、逐条判断、动手改、写回应
   ↓
@@ -153,23 +153,38 @@ rloop --commit HEAD~2      # 只审这一个 commit 引入的改动
 
 未跟踪的新文件也会进 `diff.patch`：用 `git diff --no-index` 对 `/dev/null` 生成补丁，不碰你的索引。否则"只新建了几个文件"的工作区会得到一份 0 字节补丁，reviewer 等于什么都没看到，`replay` 也复现不出当时的内容。文件太多（>100）或总量太大（>400 KB）时超出的部分只列文件名，并在 prompt 里明确点名让 reviewer 自己去读，不会悄悄丢掉。
 
-## reviewer 是只读的
+## reviewer 能跑测试，但不能改代码
 
-这是有意的，不是遗漏：
+这两件事是分开的。默认放开的是**执行**，不是**修改**：
 
-| | 跑什么 | 能改你的文件吗 | 能执行命令吗 |
+| | 跑什么 | 能执行命令吗 | 能改你的代码吗 |
 |---|---|---|---|
-| reviewer = `codex` | `codex exec --sandbox read-only` | **不能**，由 codex 的沙箱强制 | 能，但沙箱内所有写操作都被拒 |
-| reviewer = `claude` | `claude -p --permission-mode plan` | **不能** | **不能**，plan 模式下没有 shell |
+| reviewer = `codex`（默认） | `codex -s workspace-write exec` | 能，测试真的跑得起来 | 内核层面能，但改了就整轮作废 |
+| reviewer = `claude` | `claude -p --permission-mode auto` | 能 | 同上，且这边**没有**内核兜底 |
+| 加 `--no-verify` | `-s read-only` / `--permission-mode plan` | codex 能跑但写操作全被拒；claude 连 shell 都没有 | **不能**，由沙箱 / 模式强制 |
 
-reviewer 读的是可能被污染的代码和仓库里的指令文件。给它写权限，等于给提示注入开了一条改工作区、跑任意命令的通路，`--review-only`「不改你的代码」也就只剩一句口头承诺。所以 reviewer 一侧不需要写文件就能交付结果：codex 用 `--output-schema` + `-o`（这两个文件是 codex 进程自己写的，不过沙箱），claude 用 `--json-schema` 把结构化 JSON 直接打在 stdout 上，由 rloop 落成 `review.json`。
+0.3 里 reviewer 是硬只读的，代价在自审时暴露得很清楚：`--sandbox read-only` 连 `.pytest_cache` 都写不了，而 rloop 自己的测试几乎全靠 pytest `tmp_path` 造临时 git 仓库——只读下一律失败。于是 reviewer 只能静态读代码，`validation_commands` 里一片 `not_run`，`production_readiness` 封在低位上不去。放开写权限之后它能真把测试跑一遍，findings 带得上实证。
 
-代价要说清楚：
+放开的档位卡在"够跑测试"那一层，不再往上：codex 用 `workspace-write`（工作区与临时目录可写、可执行命令，**HOME 由内核挡着**），不用 `danger-full-access`，更不给 `--dangerously-bypass-*`；claude 用 `auto`，不给 `--dangerously-skip-permissions`。**这个档位是实测定的**：同一句「跑 `python3 -c 'print(6*7)'`」，`acceptEdits` 和 `dontAsk` 都答 BLOCKED（它们只自动批准文件编辑，Bash 仍要人点头，而 `-p` 模式下没人可问），只有 `auto` 真跑出了 42。给错档位比不放开更糟——reviewer 以为自己能跑，`validation_commands` 里会写满「被权限层拒绝」。
 
-- **claude 当 reviewer 时跑不了测试**。plan 模式连 Bash 都没有，它只能读代码。context pack 里已经明说了这一点，并要求它把 `validation_commands` 如实标成 `not_run`，而不是编一个"我跑了"。要 reviewer 能实跑验证，就用默认的 codex。
-- **codex 当 reviewer 时写操作会失败**。`pytest` 想写 `.pytest_cache` 会被沙箱拒掉，prompt 里提示了用 `-p no:cacheprovider` 之类的办法绕开，或如实报 `fail`。**更要紧的是：任何用到临时目录的测试它都跑不了**——比如 rloop 自己的测试几乎全靠 pytest `tmp_path` 造临时 git 仓库，只读沙箱下一律失败。审这类项目时 reviewer 只能读代码，`production_readiness` 会因此上不去，这是安全换来的真实代价。
-- **项目级扩展被关掉了，用户级配置没有**。claude 侧 `--safe-mode` 关掉 hook、MCP、插件、自定义命令与 agent、`CLAUDE.md`；codex 侧不传 `--dangerously-bypass-hook-trust`，所以未经 trust 的仓库 hook 不会执行，`--ignore-rules` 丢掉仓库的 execpolicy，`--ephemeral` 不落会话。
-- **但这仍然不是对抗恶意仓库的强隔离**。两边各自的用户级配置（`~/.claude/settings.json`、`~/.codex/config.toml` 及其中已 trust 的 hook）照常生效；只读沙箱挡的是写操作，挡不住读——reviewer 会读遍整个仓库，提示注入的入口一直都在。审**别人的**、你不信任的代码，请自己套一层容器或独立 worktree。
+「reviewer 不改你的代码」这件事，靠的不是它自觉：
+
+1. **prompt 里的明令**——context pack 直接写着它绝不能改这个项目的代码，以及越界的后果。
+2. **工作区指纹 + 执行记录，两个信号**——起 reviewer 之前给工作区拍一张指纹（`git status --porcelain` + `HEAD` + `git diff HEAD` 的摘要 + 每个未跟踪文件的内容哈希，排除 `.review-loops/`），它退出后再拍一张比对：
+   - 指纹里 `HEAD`、已跟踪文件的内容、或**基线里已有的未跟踪文件**变了（未跟踪文件的内容一样会进送审补丁），**并且**它自己的日志里有动手痕迹（codex 的 `file_change` 事件，或 `sed -i`、`git commit`、往源码文件重定向这类命令，且不在临时目录里 —— 在 `/tmp` 建仓库复现 finding 是正当的评审动作）→ **整轮作废**（退 1）。这一轮的判断建立在一份它自己动过的代码上，"把测试改绿了"和"代码本来就对"在结果里长得一模一样。
+   - 指纹变了但没有动手痕迹 → 只提醒。**评审要跑好几分钟，你在这期间接着改自己的代码是 rloop 的正常用法**；指纹知道工作区变了，不知道是谁变的，所以第二个信号是必须的（这条是被一次真实误判逼出来的，见下）。
+   - 只是多出些未跟踪文件 → 点名告诉你多了哪些。跑测试掉产物是常态，够不上作废；但未跟踪文件**会进下一轮的送审范围**，所以该 `.gitignore` 的得加上。被 `.gitignore` 的产物本来就不进 `git status`，不会惊动指纹。
+
+   不对称之处：动手痕迹来自 codex 的 `--json` 事件流，claude 那边没有等价的东西可扫，所以 claude 当 reviewer 时只会得到提醒，不会被作废。**给 claude 的 prompt 里也照实这么写** —— 把「改了就作废」原样说给一个触发不了作废的路径，那是拿一句执行不了的威慑当保险。
+
+**为什么不干脆让 reviewer 跑在快照里。** 复制一份工作区（或 `git worktree add`）让 reviewer 在里面跑，作者改原工作区互不干扰，它改了也无所谓 —— 两轮自审里 reviewer 都把这个当成首选修法提了。没这么做的原因很具体：快照带不走被 `.gitignore` 掉的东西，而那正是 venv、`node_modules`、构建缓存的所在。在一个新 worktree 里 `pytest` 多半直接起不来 —— 那就把这次放开的**唯一目的**掐掉了。所以现状是明摆着的取舍：要真跑测试，就得跑在真工作区上；代价是「谁改的」只能靠两个信号推断，而不是靠隔离消除。
+
+什么时候关掉：**审你不信任的代码时用 `--no-verify`。** 放开写权限的同时也就放开了"仓库里一句提示注入能让 reviewer 做什么"的上界。
+
+还有两条不随档位变：
+
+- **项目级扩展始终关着，用户级配置始终开着**。claude 侧 `--safe-mode` 关掉 hook、MCP、插件、自定义命令与 agent、`CLAUDE.md`；codex 侧不传 `--dangerously-bypass-hook-trust`（未经 trust 的仓库 hook 不会执行）、`--ignore-rules` 丢掉仓库的 execpolicy、`--ephemeral` 不落会话。这一层必须单独堵：仓库 hook 是在模型说第一句话之前就跑掉的 `command`，plan 模式和沙箱档位都管不着它。
+- **这不是对抗恶意仓库的强隔离**。两边各自的用户级配置（`~/.claude/settings.json`、`~/.codex/config.toml` 及其中已 trust 的 hook）照常生效；沙箱挡写不挡读——reviewer 会读遍整个仓库，提示注入的入口一直都在。审**别人的**、你不信任的代码，请自己套一层容器或独立 worktree。
 
 ## 双评分
 
@@ -319,7 +334,7 @@ python3 -m pytest <仓库路径>/tests
 - **单轮契约**：一次 `rloop` 只起一次 agent、绝不改代码；达标退 0 并关闭 loop；未达标退 2 且 loop 保持 `open`；reviewer 非零退出如实报错而不是吞掉。
 - **续轮**：第二次跑接在同一个 loop 上、轮次递增；第 2 轮 reviewer 确实拿到了上轮 findings 与你写的 `response.md`；没写回应时日志明说会被判 `not_fixed`；`--new` 与显式范围参数各自另起 loop；跑满轮数后 `can_continue` 变 false。
 - **门禁自洽**：双 9 分 + `blocking_findings=0` + `verdict=pass` 但 findings 里躺着 critical → 退 3；verdict 与分数矛盾 → 退 3；分数越界 → 退 3；未达标却零 findings → 退 3；reviewer 吐垃圾 → 退 1。
-- **命令行契约**：codex reviewer 拿到 `--sandbox read-only --ephemeral --output-schema`，且**没有**任何绕过开关；claude reviewer 拿到 `--permission-mode plan --safe-mode --no-session-persistence --json-schema`；`--effort` 与 `--reviewer-model` 各自落对。
+- **命令行契约**：codex reviewer 拿到 `-s workspace-write`（且 `-s` / `-C` 排在 `exec` **之前**，否则 codex 直接报 unexpected argument，沙箱等于没起来）加 `--ephemeral --output-schema`，**没有** `danger-full-access`、也没有任何 `--dangerously-bypass-*`；claude reviewer 拿到 `--permission-mode auto --safe-mode --no-session-persistence --json-schema`，没有 `--dangerously-skip-permissions`；`--no-verify` 把两边分别打回 `read-only` / `plan` 并落进 `loop.json`；`--effort` 与 `--reviewer-model` 各自落对。
 - **`--json` 载荷**：退出码、轮次、分数、findings、三个路径字段都在，且 `patch_path` 真的存在；范围钉死时 `fix_allowed` 为 false；不加 `--json` 时 stdout 不吐 JSON。
 
 ### 默认档绝不会拉起真实 agent
@@ -361,6 +376,24 @@ PATH="/tmp/fakebin:$PATH" python3 -m pytest -q
 - `test_two_rounds_continue_the_same_loop_with_a_real_reviewer`（`-n 3 -m 9.5`）：把循环跑满一圈。测试自己扮演开发会话——第一轮拿到 findings 后真的去改工作区、写 `response.md`，再跑一次 rloop。断言它接在**同一个 loop** 上、轮次递增、第 2 轮的 context pack 确实带上了上轮 findings 与那份回应、且真 reviewer 给出了 `prior_findings_status`。门槛调到 9.5 是为了让第 1 轮几乎必然未达标，好把续轮逻辑拉进来。
 
 分数高低一概不断言——那是模型的判断，不该当测试的稳定性依据。机器上没有 `codex` 时 skip 而不是 fail。
+
+### 真实链路验证记录（v0.4.0，放开沙箱那一版）
+
+2026-08-11 本机实跑，审的就是"把 reviewer 从只读放开到 `workspace-write`"这笔改动本身，真实 codex 当 reviewer，303 秒。
+
+**放开确实拿到了实证。** reviewer 自己跑了 `pytest -q`（135 秒、`5 failed, 255 passed, 17 errors`），跑了针对性子集（`10 passed`、`122 passed`），还**在一个临时 git 仓库里复现了它提的 finding**。同一份代码在只读档下它只能读——这就是放开换来的东西。
+
+**它当场抓出一个真洞。** 指纹当时只记 `status` / `HEAD` / `git diff HEAD`，而未跟踪文件的内容会进送审补丁却不进 `git diff`——改一个已存在的未跟踪源码文件，三个维度纹丝不动。它建了临时仓库把这条复现了出来（`changed=[]`），列为 high。现在指纹多了 `untracked` 这一维（逐文件记大小和 mtime），回归用例是 `test_editing_an_untracked_file_counts_as_touching_the_code`。
+
+**沙箱边界也量出来了。** 那 22 个失败全是评审环境所致，不是代码问题：17 个 error 是 `socket.bind` 撞上 `PermissionError: [Errno 1] Operation not permitted`（沙箱不给网络，面板测试要绑本地端口），5 个 failed 是 `ps` 在沙箱里看不到别的进程、于是依赖"进程还活着吗"的用例断在空字符串上。这两类现在写进了 context pack，明确要求 reviewer 认出来、记 `fail` 并注明原因，别拿它开 finding。
+
+**claude 侧的档位是拿同一个仓库对照出来的。** 一个两行的临时仓库，同一份改动审两遍：`acceptEdits` 那次，`cat` / `git status` 跑通了，但 `python3 -c "import a; print(a.f())"` 记成 `not_run`，note 写着"被权限层拒绝（This command requires approval）"；换成 `auto` 之后，同样五条命令全 `pass`，其中 `f() = 2` 是真跑出来的。`acceptEdits` 和 `dontAsk` 只自动批准文件编辑，Bash 仍要人点头 —— 而 `-p` 模式下没人可问。给错档位比不放开更糟：reviewer 以为自己能跑，`validation_commands` 里写满"被拒绝"。
+
+**第二轮自审（同一天，339 秒）又拆了三个假设。** 它实测出 `rg -n apply_patch rloop.py` 会被判成「动手证据」——一条纯检索命令，白烧一整轮；现在写命令必须出现在命令位置上（行首、`;` `&&` `|` 之后、或 `zsh -lc "` 之后），检索自己的源码不再触发。它还把「改内容不可能既不改大小又不动 mtime」这条假设做掉了：同长度的 `aaaa` 改成 `bbbb`、`os.utime` 复原时间戳，四个维度全静止——所以未跟踪文件现在算内容哈希，不再只记元数据。第三条是文案：日志里那句「它看的是起跑那一刻的快照」根本不成立，reviewer 直接跑在工作区上、读的是实时文件，改成了「可能落在改前改后的混合状态上」。三条各自都带着可复现的验证命令。
+
+**第三轮又抓到一种误作废。** reviewer 复现 finding 的标准动作是在 `/tmp` 建个临时仓库、写文件、`git commit` —— 前几轮它自己就这么干过。这些命令一度会被记成"动手证据"，只要作者恰好同时改了真工作区，两个互不相干的信号就凑成一次误作废。现在带 `cd /tmp`、`git -C /tmp`、`mktemp`、`tempfile` 的命令一律不算证据；代价是这也成了一条逃生阀，但误作废整轮比漏判贵得多，这个方向的偏保守是有意的。
+
+**这一轮被自己的保险误杀了，然后保险改了。** 评审跑的那五分钟里，作者（就是写这段的会话）在改 `rloop.py`——于是指纹对不上，rloop 判定"reviewer 动了被审的代码"，303 秒的评审连同上面那些实证一起被作废。指纹能证明工作区变了，证明不了是谁变的，而**边改边审正是 rloop 的用法**。现在作废要两个信号：指纹动了，**并且** reviewer 自己的日志里有动手痕迹（codex 的 `file_change` 事件，或 `sed -i` / `git commit` / 往源码文件重定向这类命令）。只有指纹动了就仅仅提醒。回归用例是 `test_the_author_editing_during_the_round_does_not_void_it`。
 
 ### 真实链路验证记录（v0.3.0，会话驱动）
 
@@ -429,9 +462,9 @@ PATH="/tmp/fakebin:$PATH" python3 -m pytest -q
 | `python3 -m pytest -m integration -q` | `8 passed, 2 skipped, 105 deselected` |
 | `RLOOP_E2E=1 python3 -m pytest -m integration -q -k "full_loop or two_rounds"` | `2 passed in 166.76s`（真实 codex，含续轮） |
 
-### reviewer 只读——两个 CLI 上的实证
+### `--no-verify` 的只读档——两个 CLI 上的实证
 
-只写对参数不等于真的拦得住，所以两边各拿一次真实调用验过（临时 git 仓库，提示词直接命令模型去写文件）：
+只写对参数不等于真的拦得住，所以两边各拿一次真实调用验过（临时 git 仓库，提示词直接命令模型去写文件）。**这一节记录的是 `--no-verify` 那一档**——0.4 之前它是唯一的行为，现在要显式加开关才回到这里：
 
 **codex `--sandbox read-only`**
 
@@ -484,15 +517,17 @@ $ claude -p "…(1) 跑 python3 -c 'print(6*7)' (2) 跑 echo pwned > PWNED2.txt�
 - `stalled` 出口只有纯函数层的 `detect_stall` 覆盖，没有端到端用例（要造连续 3 轮分数持平的剧本）。`converged` / `needs_work` / `exhausted` / `inconsistent` / `pinned_scope` / `failed` 都在 fake-agent 那一档实跑过。
 - `notify()` 的 `macos` 与 `cmd` 两个分支、`rloop list/status/logs/report/replay/stop` 六个子命令，都还没有自动化用例。
 - KeyboardInterrupt 中断路径没测。loop 被中途杀掉会停在 `status=running`，下一次裸调 `rloop` 会**接管**它（拿到锁却发现是 running，说明上个进程死了）；那一轮若没留下可用的 `review.json`，会退回去重跑该轮。
-- reviewer 只读这件事，在 fake-agent 那一档只验到「命令行参数对不对」，两个 CLI **真的**会不会拦住写操作是靠下面的手工实证记录，没有自动化用例（要真跑模型）。
-- **只读沙箱让 reviewer 跑不了 pytest**。这是 0.3.0 自审时暴露的真实张力：rubric 要求它实际运行验证命令，而 `--sandbox read-only` 连 `__pycache__` 都写不了，于是它只能退回静态解析 + 纯函数冒烟，并在 `validation_commands` 里如实标 `fail`。安全和验证深度在这里是直接冲突的，目前选了安全。
+- 沙箱档位这件事，在 fake-agent 那一档只验到「命令行参数对不对」，两个 CLI **真的**放开到哪、`--no-verify` 真的拦不拦得住，靠的是上面的手工实证记录，没有自动化用例（要真跑模型）。
+- **动手证据靠扫日志，不是靠内核**。`reviewer_write_evidence` 认的是 codex 的 `file_change` 事件和一小撮明确的写命令（`sed -i`、`git commit`、往源码文件重定向……）。刻意绕过它不难（比如用 python 脚本写文件），只是那已经不是「模型顺手改了一下」而是「模型在躲检测」了。claude 侧没有等价的事件流，扫不到东西，所以那边只会提醒、不会作废。
+- **指纹是失败开放的**。git 挂了或者超时，指纹就拍不全，reviewer 照样带着写权限跑，只是没人核对它。这时 loop.log 里会明说拍到了几个维度 —— 但不会自动降级成只读。
+- **放开之后仍有跑不了的测试**。`workspace-write` 不给网络也不给进程可见性，绑端口、起本地服务、`ps` 探进程的用例照样红。context pack 里教了 reviewer 怎么认出这类失败，但认错了它就会拿环境限制去开 finding —— 这一层没有自动化保障。
 
 ## 需要知道的
 
-- **rloop 自己不改代码**。它只起一个只读的 reviewer 子进程。改动由调用它的会话做，你看得见、能打断、能否决。
+- **rloop 自己不改代码**。reviewer 子进程默认能跑测试，但动了被审的代码这一轮就作废。改动由调用它的会话做，你看得见、能打断、能否决。
 - **跑之前最好先 commit 一次**。送审范围会干净很多，事后也能用 `git diff` 看出这一轮到底动了什么。
 - **配额是共享的**。reviewer 不占用你的交互会话，但会跟它抢同一个账号的 rate limit。`--effort xhigh` 挖得深很多，也贵很多。
-- **reviewer 只读，但不是绝对隔离**。`--safe-mode` / `--sandbox read-only` 关掉了仓库定制与写权限，可两家 CLI 的隔离边界都不是为对抗恶意仓库设计的。别拿它审你完全不信任的代码。
+- **reviewer 有写权限，隔离也不是绝对的**。`--safe-mode` / `--ignore-rules` 关掉了仓库定制，`workspace-write` 让内核挡在 HOME 前面，可两家 CLI 的隔离边界都不是为对抗恶意仓库设计的，claude 那边更是压根没有内核这一层。审你完全不信任的代码时加 `--no-verify`，最好再套一层容器或独立 worktree。
 - **codex 并发**：本机 `SessionEnd` hook 会 nohup 拉起 `auto-ingest.sh` → `codex exec` 做 wiki 摄入。rloop 跑着时若会话结束，会有两个 codex 同时在跑。目前没有互斥。
 - **裸调时同一项目只跑一个 loop**。第二个裸调会明确报 busy，不会另起一个并行 loop 跑同一份范围（首次启动那一小段由项目级锁保护，续轮由 per-loop 锁保护）。**显式 `--new` 会绕过这个限制**，允许并行——那是有意留的逃生口，代价是同时烧两份配额、留下两个互相独立的账本，之后 `status` / `logs` 默认只跟最近那个。
 - **`rloop stop` 只发信号，不写任何状态**。它收掉 reviewer（连同其派生的 shell、测试进程）和 rloop 自己，然后就结束了；发信号前会用 `ps` 核对 pid 的命令行，免得 pid 被系统回收复用后误杀你别的活。

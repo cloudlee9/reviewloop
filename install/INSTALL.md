@@ -115,9 +115,13 @@ rloop web
 
 ## 已知的限制
 
-- **reviewer 跑在只读沙箱里，跑不了你的测试。** 这是安全和验证深度的直接冲突，
-  目前选了安全：reviewer 读代码做判断，在 `validation_commands` 里如实标注哪些
-  命令它没能真跑。所以它对「这段代码实际行为」的判断可能出错，你有证据就反驳。
+- **reviewer 默认能跑测试，也就能改文件。** 沙箱放开到 codex 的 `workspace-write`
+  （claude 是 `auto`），它才跑得动 pytest；代价是「不改你的代码」这条不再由
+  内核强制，而是靠 prompt 明令加工作区指纹核对——它真动了被审代码，这一轮会作废。
+  审你不信任的代码时加 `--no-verify` 关回只读，那时它拿不到实证，
+  `validation_commands` 会如实标 `not_run`。
+- **跑测试会掉产物。** 没进 `.gitignore` 的那些会被指纹看见，rloop 点名提醒但不作废；
+  要留意它们会进下一轮的送审范围。
 - **只有 codex 有细粒度进度。** reviewer 是 claude 时，面板上看不到它执行的每条
   命令（claude 不吐那种事件流），只有轮次开始/评分/结束几个节点。`rloop api meta`
   里如实声明了这一点。

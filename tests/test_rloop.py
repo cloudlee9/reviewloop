@@ -858,3 +858,196 @@ def test_the_history_table_stays_clean_without_usage():
     h = [hist(1, 7.0, 6.0, 1)]
     assert "实付" not in rloop.render_score_history(h)
     assert "实付" not in rloop.plain(rloop.render_history(h, 8.0))
+
+
+# ─────────── reviewer 能不能跑命令验证 ───────────
+
+def test_verify_is_on_by_default_and_can_be_turned_off():
+    """默认让 reviewer 能跑测试。
+
+    拿不到实证的评审只能靠读代码猜，production_readiness 也就永远封在 5 分 ——
+    那正是这个工具长期以来最实的一个短板。
+    """
+    codex_on = rloop.reviewer_cmd("codex", Path("/p"), "P", Path("/s"), Path("/o"))
+    assert "workspace-write" in codex_on, "默认没给 reviewer 验证能力"
+    codex_off = rloop.reviewer_cmd("codex", Path("/p"), "P", Path("/s"), Path("/o"),
+                                   verify=False)
+    assert "read-only" in codex_off and "workspace-write" not in codex_off
+
+
+def test_the_loosened_sandbox_is_the_smallest_one_that_works():
+    """放开到 workspace-write 就够，不许用更宽的档。
+
+    实测过这三件事：workspace-write 下 pytest 跑得通、/tmp 写得进、
+    但写 HOME 会被内核拒（operation not permitted）。
+    danger-full-access 和 --dangerously-bypass-approvals-and-sandbox 都是
+    连 HOME 一起放开，没有理由为跑个测试付那个代价。
+    """
+    cmd = rloop.reviewer_cmd("codex", Path("/p"), "P", Path("/s"), Path("/o"))
+    assert "danger-full-access" not in cmd
+    assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+    assert "--dangerously-bypass-hook-trust" not in cmd, "替仓库绕过了 hook trust"
+
+
+def test_claude_falls_back_to_plan_when_not_verifying():
+    on = rloop.reviewer_cmd("claude", Path("/p"), "P", Path("/s"), Path("/o"))
+    off = rloop.reviewer_cmd("claude", Path("/p"), "P", Path("/s"), Path("/o"),
+                             verify=False)
+    assert on[on.index("--permission-mode") + 1] == "auto"
+    assert off[off.index("--permission-mode") + 1] == "plan"
+    # 两种模式下都不许放开自定义项：仓库里的 hook 在模型说第一句话之前就会跑
+    assert "--safe-mode" in on and "--safe-mode" in off
+
+
+def test_the_permission_note_matches_what_the_reviewer_can_actually_do():
+    """说错的代价是具体的：以为自己只读就不去跑，以为自己能跑就谎称跑过。"""
+    for agent in ("codex", "claude"):
+        ro = rloop.reviewer_permission_note(agent, verify=False)
+        rw = rloop.reviewer_permission_note(agent, verify=True)
+        assert "只读" in ro or "写不了" in ro
+        assert "绝不能改这个项目的代码" in rw, f"{agent} 的放开说明没写禁令"
+    # claude 那边没有内核兜底，必须说明白
+    assert "没有操作系统层面的沙箱" in rloop.reviewer_permission_note("claude", True)
+    assert "内核" in rloop.reviewer_permission_note("codex", True)
+    # 越界的后果也要说实话。codex 那边有事件流可查，作废是真会发生的；claude 那边
+    # 扫不到执行记录，作废触发不了 —— 照抄"会作废"就是拿一句执行不了的威慑当保险。
+    assert "整轮作废" in rloop.reviewer_permission_note("codex", True)
+    claude_note = rloop.reviewer_permission_note("claude", True)
+    assert "整轮作废" not in claude_note, "对 claude 许了一个执行不了的诺"
+    assert "触发不了" in claude_note and "本来就不作数" in claude_note
+
+
+def test_the_fingerprint_notices_the_reviewer_touching_the_code():
+    """指纹是放开写权限之后唯一的硬保险，不能只靠 prompt 里嘱咐一句。"""
+    base = {"status": [" M a.py"], "head": "abc", "diff": "h1"}
+    assert rloop.fingerprint_changed(base, dict(base)) == []
+    assert rloop.fingerprint_changed(base, {**base, "diff": "h2"}) == ["diff"]
+    assert rloop.fingerprint_changed(base, {**base, "head": "def"}) == ["head"]
+    # 同一个文件被改第二次时 status 字符串不变，只有内容摘要能抓到
+    assert rloop.fingerprint_changed(base, {**base, "diff": "h3"}) == ["diff"]
+
+
+def test_editing_your_own_code_during_a_review_is_not_blamed_on_the_reviewer(tmp_path):
+    """回归用例，来自一次真实的误判。
+
+    第一版只看指纹：工作区在评审期间变了就整轮作废。可评审要跑好几分钟，而"边改边审"
+    正是 rloop 的用法 —— 第一次实跑时作者在那五分钟里改了两行 `rloop.py`，303 秒的
+    评审连同它跑出来的实证一起被判无效。指纹能证明工作区变了，证明不了是谁变的，
+    所以作废必须有第二个信号：reviewer 自己的执行记录。
+    """
+    log = tmp_path / "reviewer.log"
+
+    def ev(cmd):
+        return json.dumps({"type": "item.completed",
+                           "item": {"type": "command_execution", "command": cmd}},
+                          ensure_ascii=False)
+
+    # 一次规规矩矩的评审：读代码、跑测试、往 /tmp 写点东西
+    log.write_text("\n".join([
+        '{"type":"thread.started","thread_id":"x"}',
+        ev("/bin/zsh -lc 'pytest -q'"),
+        ev("/bin/zsh -lc \"git status --short && sed -n '1,620p' diff.patch\""),
+        ev("/bin/zsh -lc 'python3 - <<PY > /tmp/probe.log\\nprint(1)\\nPY'"),
+        ev("/bin/zsh -lc 'git diff --check'"),
+    ]), encoding="utf-8")
+    assert rloop.reviewer_write_evidence(log) == [], "把正常评审动作当成了动手改代码"
+
+    # 检索自己的源码不是动手 —— reviewer 实测抓到的误判：
+    # `rg -n apply_patch rloop.py` 曾经被当成写入证据，一条纯检索命令白烧一整轮。
+    for cmd in ("/bin/zsh -lc \"rg -n apply_patch rloop.py\"",
+                "/bin/zsh -lc 'grep -rn \"git commit\" README.md'",
+                "/bin/zsh -lc \"nl -ba rloop.py | sed -n '600,700p'\"",
+                "/bin/zsh -lc 'git status --short && git log --oneline'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log) == [], f"检索命令被判成动手：{cmd}"
+
+    # 在临时目录里复现 finding 不是动手 —— reviewer 实测抓到的第二种误判：
+    # 它为了复现问题在 /tmp 建仓库、写文件、commit，全是正当的评审动作；作者若
+    # 恰好同时改了真工作区，两个互不相干的信号会凑成一次误作废。
+    proj = tmp_path / "proj"
+    for cmd in ("/bin/zsh -lc 'cd /tmp/probe && echo x > sample.py'",
+                "/bin/zsh -lc 'cd /tmp/probe && git commit -am probe'",
+                "/bin/zsh -lc 'git -C /tmp/probe commit -am x'",
+                "/bin/zsh -lc 'd=$(mktemp -d) && cd $d && git commit -qm x'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log, proj) == [], f"临时目录里的操作被判成动手：{cmd}"
+
+    # 但项目自己目录下的同类命令照抓不误
+    log.write_text(ev(f"/bin/zsh -lc 'cd {proj} && echo x > a.py'"), encoding="utf-8")
+    assert rloop.reviewer_write_evidence(log, proj), "cd 回项目里的写操作被放过了"
+
+    # 真动手的样子：写命令得出现在命令位置上
+    for cmd in ("/bin/zsh -lc \"sed -i '' 's/foo/bar/' rloop.py\"",
+                "/bin/zsh -lc 'echo x > rloop.py'",
+                "/bin/zsh -lc 'git commit -am wip'",
+                "/bin/zsh -lc 'pytest -q && git checkout -- rloop.py'",
+                "apply_patch <<'EOF'"):
+        log.write_text(ev(cmd), encoding="utf-8")
+        assert rloop.reviewer_write_evidence(log), f"没认出动手证据：{cmd}"
+
+    # codex 用自己的工具改文件时走事件，不经过 shell
+    log.write_text(json.dumps({"type": "item.completed",
+                               "item": {"type": "file_change", "path": "rloop.py"}}),
+                   encoding="utf-8")
+    assert rloop.reviewer_write_evidence(log)
+
+    assert rloop.reviewer_write_evidence(tmp_path / "根本没有这个文件") == []
+
+
+def test_test_droppings_are_named_not_treated_as_tampering():
+    """跑测试必然掉产物；把那个当成"改了代码"，放开写权限这件事就白做了。
+
+    但只是"多出文件"才不算 —— 未跟踪文件会进下一轮的送审范围，所以要点名。
+    """
+    base = {"status": [" M a.py"], "head": "abc", "diff": "h1",
+            "untracked": ["notes.md\t10\t111"]}
+    after = {**base, "status": [" M a.py", "?? out.log"],
+             "untracked": ["notes.md\t10\t111", ".pytest_cache/v/x\t3\t222", "out.log\t9\t333"]}
+
+    assert rloop.tampered_dimensions(base, after) == [], "多出文件被判成了改代码"
+    assert rloop.fingerprint_changed(base, after) == ["status", "untracked"]
+    assert rloop.new_paths(base, after) == [".pytest_cache/v/x", "out.log"], "没点名多出来的是哪些"
+
+    # 反过来：代码真被动了的时候，多出来的文件不能把它盖过去
+    assert rloop.tampered_dimensions(base, {**after, "diff": "h2"}) == ["diff"]
+
+
+def test_editing_an_untracked_file_counts_as_touching_the_code():
+    """reviewer 自己抓出来的洞（0.4.0 第一次实跑，high）。
+
+    未跟踪文件的内容一样会进送审补丁。可它改一个**已经存在**的未跟踪源码文件时，
+    `?? path` 那行不变、`git diff HEAD` 根本不看它、HEAD 也没动 —— 前三个维度
+    全静止。所以指纹必须单独记未跟踪文件的大小和 mtime。
+    """
+    base = {"status": ["?? new.py"], "head": "abc", "diff": "h1",
+            "untracked": ["new.py\t120\t111"]}
+    edited = {**base, "untracked": ["new.py\t180\t222"]}
+
+    assert rloop.tampered_dimensions(base, edited) == ["untracked"], "改未跟踪源码没被抓到"
+    assert rloop.fingerprint_changed(base, edited) == ["untracked"]
+    assert rloop.new_paths(base, edited) == [], "改内容不该报成新增文件"
+
+    # 删掉基线里的未跟踪文件同样是动送审内容 —— 下一轮那个文件就没了
+    deleted = {**base, "status": [], "untracked": []}
+    assert rloop.tampered_dimensions(base, deleted) == ["untracked"]
+
+    # 判据是"基线里的条目还在不在、变没变"，所以 reviewer 自己生成又删掉的临时文件
+    # 两张快照都看不见，不会牵连到它
+    kept = {**base, "untracked": ["new.py\t120\t111", "build/out.o\t99\t333"]}
+    assert rloop.tampered_dimensions(base, kept) == []
+
+
+def test_a_missing_fingerprint_does_not_accuse_anyone():
+    """拍不到指纹（不是 git 仓库、git 挂了）时不许诬告。
+
+    但这道保险是**失败开放**的：拍不到就等于没人核对，reviewer 照样带着写权限跑。
+    这不是可以默不作声的取舍，所以 run_reviewer 会在维度拍不全时明说
+    （见 test_an_incomplete_fingerprint_is_announced_not_swallowed）。
+    """
+    assert rloop.fingerprint_changed({}, {"diff": "x"}) == []
+    assert rloop.fingerprint_changed({"diff": "x"}, {}) == []
+    assert rloop.tampered_dimensions({}, {"diff": "x"}) == []
+    assert rloop.tampered_dimensions({"diff": "x"}, {}) == []
+    # 缺的维度不参与比较，剩下的照常比
+    assert rloop.fingerprint_changed({"head": "a"}, {"head": "a", "diff": "x"}) == []
+    assert rloop.fingerprint_changed({"head": "a"}, {"head": "b", "diff": "x"}) == ["head"]
