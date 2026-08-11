@@ -74,7 +74,9 @@ reviewer 那几分钟不是黑盒。codex 用 `--json` 吐 JSONL 事件流，rlo
 
 成功的命令不回显（否则每条刷两行），失败的一定报 exit code。`--json` 模式下这些走 stderr，不污染 stdout 的 JSON。
 
-跑完还会把**完整结果**打在终端上：走势表、上一轮的裁决、本轮 findings（分级、`file:line`、建议）、它实际跑了什么、它建议先做什么。同一份内容也落在 `round-NN/review.md` 里。
+跑完还会把**完整结果**打在终端上：走势表、上一轮的裁决（你改的那些它认不认）、本轮 findings（分级、`file:line`、建议）、它实际跑了什么、它建议先做什么。同一份内容也落在 `round-NN/review.md` 里。
+
+**`--json` 时这份结果照打，只是走 stderr。** 会话驱动循环用的就是 `--json`，那条路径上人更需要看见 reviewer 到底说了什么——stdout 仍然只有那个 JSON 对象，解析的一方不受影响。
 
 想要图表、折叠、diff 高亮的话：
 

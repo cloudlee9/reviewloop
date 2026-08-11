@@ -2325,12 +2325,9 @@ def cmd_review(args) -> int:
     finally:
         lock.__exit__(None, None, None)
 
-    if not args.json:
-        # 结论比分数值钱得多：findings、上一轮的裁决、它到底跑了什么、下一步
-        # 建议先做什么 —— 这些以前只落在文件里，终端上一个字都看不到。
-        print_round_result(loop)
-        lock.__exit__(None, None, None)
-
+    # 结论比分数值钱得多：findings、上一轮的裁决、它到底跑了什么、下一步建议
+    # 先做什么 —— 这些一律要打给人看。`--json` 时走 stderr，stdout 留给调用方。
+    print_round_result(loop, sys.stderr if args.json else sys.stdout)
     if args.json:
         emit_json(loop, code)
     return code
@@ -3995,13 +3992,20 @@ def write_round_markdown(loop: Loop, rnd: int, review: dict) -> None:
             render_markdown(item, review), encoding="utf-8")
 
 
-def print_round_result(loop: Loop) -> None:
-    """把这一轮的完整结果打到终端。渲染逻辑和面板共用一份。"""
+def print_round_result(loop: Loop, stream=None) -> None:
+    """把这一轮的完整结果打到终端。渲染逻辑和面板共用一份。
+
+    `--json` 模式下走 stderr，**不是不打**。早先这里是 `if not args.json` —— 而
+    驱动循环的会话恰恰用的就是 `--json`，于是最需要看结果的那条路径上，人在终端
+    上只能看到「6.5 / 4.0 / 2 个阻塞项」，reviewer 到底报了哪三条一个字都没有。
+    stdout 仍然只有那份 JSON，契约没变；日志早就是这么分流的。
+    """
     item = loop_item(loop)
     width = shutil.get_terminal_size((100, 24)).columns
-    print()
+    out = stream or sys.stdout
+    print(file=out)
     print(plain(render_detail(
-        item, load_review(loop, item["round"]), min(110, max(60, width)))))
+        item, load_review(loop, item["round"]), min(110, max(60, width)))), file=out)
 
 
 def subcommands() -> set:

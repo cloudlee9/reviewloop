@@ -787,6 +787,50 @@ def test_no_verify_puts_the_codex_reviewer_back_behind_read_only(tmp_path):
     assert r.loop.state["verify"] is False, "loop.json 没记下这一档，续跑会悄悄变回放开"
 
 
+def test_json_mode_still_shows_the_findings_to_the_human(tmp_path):
+    """`--json` 不等于「什么都不给人看」。
+
+    驱动循环的会话用的就是 `--json`，而这里曾经是 `if not args.json: 打结果` ——
+    于是最常走的那条路径上，终端里只有「6.5 / 4.0 / 2 个阻塞项」，reviewer 到底
+    报了哪几条一个字都没有。人得开面板才知道发生了什么。
+
+    结果一律要打，`--json` 时走 stderr；stdout 仍然只有那份 JSON。
+    """
+    finding = {"id": "F1", "severity": "critical", "category": "correctness",
+               "file": "cache.py", "line": 42,
+               "description": "过期判定用了本地时钟，多实例下会各清各的。",
+               "suggested_fix": "把过期时刻写进 value 里。"}
+    r = Harness(tmp_path / "show", [review(findings=[finding])]).run()
+
+    err = r.proc.stderr
+    assert "本轮 findings" in err, f"终端上看不到 findings 那一节：\n{err[-500:]}"
+    assert "cache.py:42" in err and "本地时钟" in err, "findings 的内容没打出来"
+    assert "把过期时刻写进 value 里" in err, "建议的修法没打出来"
+
+    # stdout 仍然只有 JSON —— 会话是靠解析它工作的，掺一个字都不行
+    payload = json.loads(r.proc.stdout)
+    assert payload["findings"][0]["id"] == "F1"
+
+
+def test_the_verdicts_on_last_round_reach_the_terminal_too(tmp_path):
+    """「我改的那些它认不认」是续轮时最要紧的信息，不能只躺在文件里。"""
+    prior = [{"id": "F1", "status": "fixed", "note": "改对了，比我建议的还干净"},
+             {"id": "F2", "status": "not_fixed", "note": "回应里说改了，但那段代码没动"}]
+    still = {"id": "F2", "severity": "high", "category": "correctness", "file": "a.py",
+             "line": 9, "description": "仍然没修。", "suggested_fix": "照上一轮说的改。"}
+    h = Harness(tmp_path / "verdict",
+                [review(), review(findings=[still], prior=prior)])
+    r1 = h.run()
+    h.write_response(r1.loop, 1)
+    h.author_edits()
+    r2 = h.run()
+
+    err = r2.proc.stderr
+    assert "对上一轮的裁决" in err, f"续轮没把裁决打出来：\n{err[-600:]}"
+    assert "fixed" in err and "not_fixed" in err
+    assert "那段代码没动" in err, "裁决的理由没打出来 —— 只给状态词等于没说"
+
+
 def test_no_verify_takes_effect_on_a_resumed_loop_too(tmp_path):
     """自审抓到的最硬一条：`--no-verify` 在续轮时是一句静默失效的咒语。
 
