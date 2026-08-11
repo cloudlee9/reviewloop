@@ -750,6 +750,16 @@ def test_a_void_says_so_in_the_ledger_and_the_report(tmp_path):
     assert "作废" in (r.state.get("fingerprint_note") or ""), "指纹裁决没落进账本"
     assert "作废" in rloop.render_report(r.loop), "报告里看不到工作区核对的结果"
 
+    # 最要紧的一条：作废那一轮的产物一个都不许发给驱动会话。review.json 是
+    # reviewer 进程在作废判定**之前**就写好的，照常读得出来 —— 发出去的话，
+    # 会话会拿着一份已经判定不可信的 findings 去改代码。
+    payload = json.loads(r.proc.stdout)
+    assert payload["voided"] is True, "载荷里没标出这一轮作废了"
+    assert payload["findings"] == [] and payload["prior_findings_status"] == []
+    assert all(v is None for v in payload["scores"].values()), \
+        f"作废轮的评分还是发出去了：{payload['scores']}"
+    assert payload["summary"] is None
+
 
 def test_the_author_editing_during_the_round_does_not_void_it(tmp_path):
     """回归用例，来自第一次实跑时的误判。
@@ -794,6 +804,8 @@ def test_no_verify_takes_effect_on_a_resumed_loop_too(tmp_path):
 
     assert len(r2.loops) == 1, "前提：这确实是续轮，不是另起了一个 loop"
     assert r2.state["verify"] is False, "--no-verify 没落进 loop.json"
+    assert json.loads(r2.proc.stdout)["verify"] is False, \
+        "档位没进 --json 载荷，驱动会话判断不了 validation_commands 是真跑的还是推断的"
     assert r2.calls[-1]["argv"][1] == "read-only", "沙箱没关回只读"
     log = (r2.loop.root / "loop.log").read_text("utf-8")
     assert "关回只读" in log, "档位变了却一声不吭"

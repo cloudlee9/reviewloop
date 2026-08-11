@@ -2058,6 +2058,13 @@ def emit_json(loop: Loop, code: int):
     rnd = s.get("round", 0)
     review = load_review(loop, rnd) or {}
     outcome = s.get("outcome") or s.get("status")
+    # 作废那一轮的产物**一律不往外发**。reviewer 动过被审代码，它这一轮的 findings
+    # 和评分就建立在一份自己改过的代码上 —— 而 review.json 是 codex 进程在作废判定
+    # 之前就写好的，照常读得出来。交给驱动会话的话，它会拿着一份已经被判为不可信的
+    # 清单去改代码，「作废」这两个字就白说了。
+    voided = (s.get("fingerprint_note") or "").startswith("**这一轮作废**")
+    if voided:
+        review = {}
     payload = {
         "loop_id": s["id"],
         "project": s["project"],
@@ -2074,6 +2081,11 @@ def emit_json(loop: Loop, code: int):
         # 范围钉死在历史提交上时，你改工作区也不会进入送审 diff —— 别改，只报告。
         "fix_allowed": s.get("diff_target") is None,
         "consistency_errors": s.get("consistency_errors") or [],
+        # 这一轮 reviewer 是带写权限跑的还是只读跑的 —— 驱动会话据此判断
+        # validation_commands 到底是真跑出来的还是静态推断的。
+        "verify": bool(s.get("verify", True)),
+        # 被保险作废了：下面的 scores / findings 全是空的，别拿它做判断。
+        "voided": voided,
         "scores": {
             "deliverable_maturity": review.get("deliverable_maturity"),
             "production_readiness": review.get("production_readiness"),

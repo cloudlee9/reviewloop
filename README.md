@@ -383,7 +383,7 @@ PATH="/tmp/fakebin:$PATH" python3 -m pytest -q
 
 **放开确实拿到了实证。** reviewer 自己跑了 `pytest -q`（135 秒、`5 failed, 255 passed, 17 errors`），跑了针对性子集（`10 passed`、`122 passed`），还**在一个临时 git 仓库里复现了它提的 finding**。同一份代码在只读档下它只能读——这就是放开换来的东西。
 
-**它当场抓出一个真洞。** 指纹当时只记 `status` / `HEAD` / `git diff HEAD`，而未跟踪文件的内容会进送审补丁却不进 `git diff`——改一个已存在的未跟踪源码文件，三个维度纹丝不动。它建了临时仓库把这条复现了出来（`changed=[]`），列为 high。现在指纹多了 `untracked` 这一维（逐文件记大小和 mtime），回归用例是 `test_editing_an_untracked_file_counts_as_touching_the_code`。
+**它当场抓出一个真洞。** 指纹当时只记 `status` / `HEAD` / `git diff HEAD`，而未跟踪文件的内容会进送审补丁却不进 `git diff`——改一个已存在的未跟踪源码文件，三个维度纹丝不动。它建了临时仓库把这条复现了出来（`changed=[]`），列为 high。现在指纹多了 `untracked` 这一维（当时是逐文件记大小和 mtime；那个假设在下一轮被证伪，改成了内容哈希，见下），回归用例是 `test_editing_an_untracked_file_counts_as_touching_the_code`。
 
 **沙箱边界也量出来了。** 那 22 个失败全是评审环境所致，不是代码问题：17 个 error 是 `socket.bind` 撞上 `PermissionError: [Errno 1] Operation not permitted`（沙箱不给网络，面板测试要绑本地端口），5 个 failed 是 `ps` 在沙箱里看不到别的进程、于是依赖"进程还活着吗"的用例断在空字符串上。这两类现在写进了 context pack，明确要求 reviewer 认出来、记 `fail` 并注明原因，别拿它开 finding。
 
