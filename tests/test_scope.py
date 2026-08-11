@@ -454,6 +454,12 @@ def test_the_pack_tells_the_reviewer_what_it_can_actually_do(tmp_path):
         rw = rloop.build_context_pack(loop, 1)
         assert "绝不能改这个项目的代码" in rw, f"{agent} 放开后没给禁令"
         assert "封顶" in rw, f"{agent} 没被提醒打分的硬规则没变"
+        # 负向断言不是凑数：只读那段文案原先写死在无条件的 rubric 里，放开档下
+        # 同一份 prompt 会同时说「能跑测试」和「你在一个只读沙箱里，失败两次就别
+        # 再试了」—— 后一句位置更靠后、语气更硬，正好掐掉这次放开的唯一目的。
+        # 只有正向断言的话，把那段塞回 rubric 也不会有测试红。
+        assert "只读沙箱" not in rw, f"{agent} 放开档里还留着只读的话"
+        assert "失败两次就别再试了" not in rw, f"{agent} 放开档里还在劝它别重试"
         # 越界的后果按 agent 说实话：codex 那边真会作废（有事件流可查），claude
         # 那边扫不到执行记录、触发不了作废，把"会作废"照抄给它就是拿空话当保险。
         if agent == "codex":
@@ -511,14 +517,38 @@ def test_an_untracked_file_edited_in_place_still_moves_the_fingerprint(tmp_path)
     assert rloop.tampered_dimensions(before, after) == ["untracked"]
 
 
-def test_binary_changes_do_not_silently_drop_the_diff_dimension(tmp_path):
-    """自审抓到的漏判，是这批里最要命的一个。
+def test_a_non_utf8_source_file_does_not_silently_drop_the_diff_dimension(tmp_path):
+    """自审抓到的漏判里最要命的一个 —— **以及一条假的回归用例**。
 
-    `git diff HEAD` 一度用 text=True 取输出：仓库里只要有一个二进制改动或非
-    UTF-8 编码的源文件，解码就抛 UnicodeDecodeError，被 suppress 一吞，`diff`
-    这个键干脆不存在 —— 而「缺的键不参与比较」意味着整条最重要的维度**静默消失**，
-    reviewer 改任何已跟踪文件都抓不到。
+    `git diff HEAD` 一度用 text=True 取输出，非 UTF-8 字节让解码抛异常，被
+    suppress 一吞，`diff` 这个键干脆不存在；而「缺的键不参与比较」意味着整条最
+    重要的维度**静默消失**，reviewer 改任何已跟踪文件都判不出来。
+
+    第一版回归用例用**真二进制文件**当 fixture，守不住这条：git 对二进制只输出
+    `Binary files a/x and b/x differ` —— 纯 ASCII，任何编码都解得开，把实现改回
+    text=True 全套测试照样绿。触发解码失败的是**非 UTF-8 的文本**（这里用 GBK
+    编码的源文件）：git 拿它当文本，原始字节直接进 diff 输出。
+
+    所以断言分两步：先确认这样的仓库里 diff 维度还在，再确认它真能抓到**另一个
+    普通 UTF-8 文件**的改动 —— 后者才是这条防线保护的东西。
     """
+    repo = make_repo(tmp_path)
+    (repo / "gbk.py").write_bytes("# 中文注释\nx = 1\n".encode("gbk"))
+    commit(repo, "init", **{"a.py": "x = 1\n"})     # 顺带把 gbk.py 一起提交
+    (repo / "gbk.py").write_bytes("# 中文注释改了\nx = 2\n".encode("gbk"))
+
+    before = rloop.workspace_fingerprint(repo)
+    assert "diff" in before, "仓库里有非 UTF-8 源文件，diff 维度就整个丢了"
+    assert len(before) == len(rloop.FINGERPRINT_KEYS)
+
+    # reviewer 动了一个再普通不过的文件 —— 必须抓到
+    (repo / "a.py").write_text("x = 999\n", encoding="utf-8")
+    assert rloop.tampered_dimensions(before, rloop.workspace_fingerprint(repo)) == ["diff"], \
+        "有非 UTF-8 文件在场时，改已跟踪文件抓不到了"
+
+
+def test_a_binary_change_is_still_seen(tmp_path):
+    """二进制走的是另一条路（git 只报"differ"），单独冒烟一下别让它退化。"""
     repo = make_repo(tmp_path)
     commit(repo, "init", **{"a.py": "x\n"})
     (repo / "bin.dat").write_bytes(b"\xff\xfe\x00binary")
@@ -526,9 +556,6 @@ def test_binary_changes_do_not_silently_drop_the_diff_dimension(tmp_path):
     git(repo, "commit", "-qm", "bin")
 
     before = rloop.workspace_fingerprint(repo)
-    assert "diff" in before, "有二进制文件在，diff 维度就整个丢了"
-    assert len(before) == len(rloop.FINGERPRINT_KEYS)
-
     (repo / "bin.dat").write_bytes(b"\xff\xfe\x00BINARY-CHANGED")
     assert rloop.tampered_dimensions(before, rloop.workspace_fingerprint(repo)) == ["diff"]
 
