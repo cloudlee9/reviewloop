@@ -21,11 +21,31 @@ reviewer 每轮会对上一轮的每条 finding 给出 `fixed` / `partially_fixe
 
 ## 装
 
+从 GitHub 装：
+
 ```bash
-tar xzf rloop-0.4.0.tar.gz
-cd rloop-0.4.0
+git clone https://github.com/cloudlee9/reviewloop.git
+cd reviewloop
 ./install/install.sh
 ```
+
+或者从别人给你的安装包装：
+
+```bash
+tar xzf rloop-<版本>.tar.gz
+cd rloop-<版本>
+./install/install.sh
+```
+
+包是这么打出来的（出到 `dist/rloop-<版本>.tar.gz`，版本号从 `rloop.py` 读、不写死）：
+
+```bash
+./install/pack.sh
+```
+
+它走 `git archive` 而不是 `cp -R` —— 工作区里的 `.review-loops/` 带着被审代码的
+完整快照，一次手滑的 `cp -R` 就能把别人的代码一起发出去。脚本打完会自检一遍，
+混进运行产物就报错退出。
 
 不带参数 = 机器上有 `~/.codex` 就装 Codex 侧，有 `~/.claude` 就装 Claude 侧。
 想只装一边：

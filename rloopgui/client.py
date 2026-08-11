@@ -141,6 +141,9 @@ class Client:
         args = ["--project", project]
         if opts.get("new"):
             args.append("--new")
+        # 只读档。安全开关不该只有命令行够得着 —— 面板也是主入口之一。
+        if opts.get("no_verify"):
+            args.append("--no-verify")
         for flag, key in (("--focus", "focus"), ("--label", "label"), ("--base", "base"),
                           ("--commit", "commit"), ("--reviewer", "reviewer"),
                           ("--reviewer-model", "reviewer_model"),

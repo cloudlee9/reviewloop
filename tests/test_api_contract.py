@@ -92,6 +92,23 @@ def test_declared_artifacts_all_resolve_to_a_path(tmp_path):
         assert isinstance(p, Path) and p.name
 
 
+def test_the_sandbox_tier_reaches_the_panel_both_ways(tmp_path):
+    """档位得**看得见**也**选得着**，两头都要通。
+
+    只看得见的话，面板上每一轮都带着写权限起 —— 而「审别人的代码」恰恰是最会
+    从面板顺手起一轮的场景。所以 run 要认 no_verify，loop 摘要要透出 verify，
+    meta 里要声明这个维度存在（第三方面板据此决定给不给这个开关）。
+    """
+    meta = rloop.api_meta()
+    assert meta["features"]["run_accepts_no_verify"] is True
+    assert meta["features"]["verify_default"] is True
+    assert meta["features"]["voided_rounds"] is True
+
+    # api_run 真的会把它变成命令行参数（不起进程，只看拼出来的 argv）
+    src = (REPO_ROOT / "rloop.py").read_text(encoding="utf-8")
+    assert 'opts.get("no_verify")' in src and '"--no-verify"' in src
+
+
 def test_event_kinds_cover_what_the_core_actually_emits():
     """核心 emit 的 kind 必须都在 meta.event_kinds 里声明过。"""
     src = (REPO_ROOT / "rloop.py").read_text(encoding="utf-8")

@@ -167,6 +167,11 @@ select.rounds{font:12px var(--mono);padding:2px 6px;background:var(--panel);
       </select>
       <label for="o-model">模型</label>
       <input id="o-model" placeholder="留空用 reviewer 的默认模型">
+      <label for="o-noverify">沙箱</label>
+      <select id="o-noverify">
+        <option value="">默认（能跑测试，改不了代码）</option>
+        <option value="1">只读（审来路不明的代码；它拿不到实证）</option>
+      </select>
       <div class="hint" id="o-hint"></div>
     </div>
     <div class="foot">
@@ -498,6 +503,7 @@ function formOpts(){
   if(v("o-score")) o.min_score=+v("o-score");
   if(v("o-reviewer")) o.reviewer=v("o-reviewer");
   if(v("o-effort")) o.reviewer_effort=v("o-effort");
+  if(v("o-noverify")) o.no_verify=true;
   if(v("o-model")) o.reviewer_model=v("o-model");
   return o;
 }

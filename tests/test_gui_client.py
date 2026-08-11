@@ -226,12 +226,20 @@ def test_run_passes_the_whole_form_through(fake_core, monkeypatch):
     monkeypatch.setattr(c, "_run", lambda argv, timeout=None: (seen.append(argv),
                                                                real(argv, timeout))[1])
     c.run("/p", new=True, focus="只看并发", base="main", max_rounds=3,
-          min_score=8.5, reviewer="codex", reviewer_effort="high")
+          min_score=8.5, reviewer="codex", reviewer_effort="high", no_verify=True)
     argv = seen[0]
     for expect in ("--new", "--focus", "只看并发", "--base", "main",
                    "-n", "3", "--min-score", "8.5", "--reviewer", "codex",
-                   "--reviewer-effort", "high"):
+                   "--reviewer-effort", "high",
+                   # 只读档是安全开关。它只在命令行上能碰的话，从面板起的每一轮
+                   # 都带着写权限 —— 而面板正是「审别人代码」时最顺手的入口。
+                   "--no-verify"):
         assert expect in argv, f"表单字段 {expect} 没传给核心：{argv}"
+
+    # 不选就不能带上：默认档是放开的，多一个 flag 会把它悄悄关成只读
+    seen.clear()
+    c.run("/p", reviewer="codex")
+    assert "--no-verify" not in seen[0]
 
 
 def test_empty_form_fields_are_not_passed_as_empty_flags(fake_core, monkeypatch):

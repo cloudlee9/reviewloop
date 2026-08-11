@@ -3259,6 +3259,12 @@ def api_meta() -> dict:
             # 一片让人以为面板坏了的空白。run.start/phase/score/run.end 与 reviewer
             # 是谁无关，照发。
             "progress_for_reviewer": {"codex": True, "claude": False},
+            # reviewer 默认带写权限跑（跑得动测试），`no_verify` 关回只读。
+            # 面板据此决定要不要给这个开关、以及怎么标注每个 loop 的档位。
+            "verify_default": True,
+            "run_accepts_no_verify": True,
+            # 作废那一轮的 scores/findings 会被清空，载荷里 voided 为真。
+            "voided_rounds": True,
         },
         "review_exit_codes": {"pass": EXIT_PASS, "error": EXIT_ERROR,
                               "needs_work": EXIT_NEEDS_WORK,
@@ -3552,6 +3558,9 @@ def api_run(project: Path, opts: dict) -> tuple[dict, list]:
             argv += [flag, str(opts[key])]
     if opts.get("new"):
         argv.append("--new")
+    # 只读档是安全开关，不能只有命令行够得着 —— 面板也是主入口之一。
+    if opts.get("no_verify"):
+        argv.append("--no-verify")
     if opts.get("focus"):
         argv.append(str(opts["focus"]))
 
@@ -3938,6 +3947,7 @@ def cmd_api(args) -> int:
                 "min_score": args.min_score, "reviewer": args.reviewer,
                 "reviewer_model": args.reviewer_model,
                 "reviewer_effort": args.reviewer_effort,
+                "no_verify": args.no_verify,
             })
         elif verb == "stop":
             if not args.id:
@@ -4119,6 +4129,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--reviewer", choices=["codex", "claude"], help="run：谁来审")
     a.add_argument("--reviewer-model", dest="reviewer_model", help="run：指定模型")
     a.add_argument("--reviewer-effort", dest="reviewer_effort", help="run：推理档位")
+    a.add_argument("--no-verify", action="store_true", dest="no_verify",
+                   help="run：把 reviewer 关回只读（审来路不明的代码时用）")
     # stop 借用 review 的 -C，好让 cmd_stop 原样工作
     a.add_argument("-C", "--directory", help="stop：项目目录")
     a.set_defaults(func=cmd_api)

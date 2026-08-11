@@ -28,6 +28,7 @@
 
 只要命令不要 skill：`./install/install.sh --core-only`。
 卸载：`./install/install.sh --uninstall`（不动账本和历史）。
+打一个能拿走的安装包：`./install/pack.sh` → `dist/rloop-<版本>.tar.gz`。
 
 依赖：`git`、Python **3.11+**，以及 `codex` 和/或 `claude` 至少一个。
 详见 [install/INSTALL.md](install/INSTALL.md)。
