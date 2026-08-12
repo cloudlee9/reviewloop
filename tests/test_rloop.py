@@ -917,6 +917,28 @@ def test_the_permission_note_matches_what_the_reviewer_can_actually_do():
     assert "触发不了" in claude_note and "本来就不作数" in claude_note
 
 
+def test_the_loop_total_reports_what_you_actually_pay():
+    """报「实付」而不是 input 总数 —— 后者九成是缓存命中，照它看会以为贵十倍。"""
+    hist = [
+        {"round": 1, "usage": {"input": 843035, "cached": 741376,
+                               "fresh": 101659, "output": 6926}},
+        {"round": 2, "usage": {"input": 1367291, "cached": 1284096,
+                               "fresh": 83195, "output": 8691}},
+    ]
+    tot = rloop.usage_total(hist)
+    assert tot["fresh"] == 184854 and tot["output"] == 15617
+    assert tot["input"] == 2210326 and tot["rounds"] == 2
+
+    # 拿不到用量时是 None，不是 0 ——「不知道」和「没花钱」是两回事
+    assert rloop.usage_total([]) is None
+    assert rloop.usage_total([{"round": 1}, {"round": 2}]) is None
+
+    # 混着来的时候，rounds 是**有数据的轮数**，不是总轮数：写成总轮数会让人
+    # 以为每轮都这么便宜
+    mixed = rloop.usage_total([{"round": 1, "usage": hist[0]["usage"]}, {"round": 2}])
+    assert mixed["rounds"] == 1 and mixed["fresh"] == 101659
+
+
 def test_the_fingerprint_notices_the_reviewer_touching_the_code():
     """指纹是放开写权限之后唯一的硬保险，不能只靠 prompt 里嘱咐一句。"""
     base = {"status": [" M a.py"], "head": "abc", "diff": "h1"}

@@ -3212,6 +3212,10 @@ def loop_summary(loop: Loop, state: dict | None = None,
         # 面板得知道这一轮 reviewer 是哪一档，否则「codex」这三个字底下藏着
         # 「能跑测试」还是「只读」全看不出来。
         "verify": bool(st.get("verify", True)),
+        # 这个 loop 到目前为止烧了多少。列表页正是「哪个贵」最该一眼看见的地方，
+        # 否则得逐个点进去。拿不到用量时是 None 而不是 0 —— 「不知道」和「没花钱」
+        # 是两回事。
+        "usage_total": usage_total(hist),
         "deliverable": last.get("deliverable_maturity"),
         "production": last.get("production_readiness"),
         "blocking": last.get("blocking_findings"),
@@ -3329,6 +3333,22 @@ def api_resolve(loop_id: str) -> tuple[Loop, dict]:
     raise ApiError("not_found", f"找不到 loop：{loop_id}", EXIT_API_NOT_FOUND,
                    hint="用 `rloop api --api 1 loops` 看有哪些",
                    detail={"id": loop_id})
+
+
+def usage_total(hist: list) -> dict | None:
+    """整个 loop 的用量总账。没有任何一轮拿到用量就返回 None。
+
+    报 `fresh`（实付）而不是 `input`：后者九成是缓存命中，照着它看会以为贵十倍。
+    `rounds` 是**有用量数据的轮数**，可能少于总轮数 —— reviewer 是 claude 时那些
+    轮次根本没有用量可拿，分母写成总轮数会让人以为每轮都便宜。
+    """
+    got = [h["usage"] for h in hist if h.get("usage")]
+    if not got:
+        return None
+    total = {k: sum(u.get(k) or 0 for u in got)
+             for k in ("input", "cached", "fresh", "output")}
+    total["rounds"] = len(got)
+    return total
 
 
 def history_rows(hist: list, min_score: float | None) -> list:

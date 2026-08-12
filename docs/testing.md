@@ -38,6 +38,7 @@ python3 -m pytest <仓库路径>/tests
 | `tests/test_gui_client.py` | 面板侧的 CLI 客户端 | 只起假 rloop（几十行脚本） |
 | `tests/test_gui_web.py` | 面板的 HTTP 层：鉴权、转发、出错 | 起 `ThreadingHTTPServer` + 假 client |
 | `tests/test_gui_isolation.py` | 切分的保镖：面板不许碰核心内部 | 只扫 AST，什么都不起 |
+| `tests/test_gui_markdown.py` | 面板那个 markdown 渲染器：注入、结构 | 起 `node`（没装就 skip） |
 
 ### 判定层 `tests/test_rloop.py`
 
@@ -263,11 +264,12 @@ $ claude -p "…(1) 跑 python3 -c 'print(6*7)' (2) 跑 echo pwned > PWNED2.txt�
 
 ## 还没被覆盖的部分
 
-- **面板的前端 JS 没有自动化测试**。`page.html` 里那 200 行（走势图、findings
-  折叠、diff 高亮、SSE 收敛）目前只有手工验过。服务端那一层有
-  `test_gui_web.py` 守着，客户端有 `test_gui_client.py`，中间这一段没有。
-  补它要引入一整套浏览器测试依赖，对一个单文件面板不划算 —— 现状是明确的取舍，
-  不是遗漏。
+- **面板的前端 JS 只有一档有测试**。markdown 渲染器有
+  `test_gui_markdown.py`（抠出来喂给 node 跑，重点是注入）—— 它渲染的是 reviewer
+  的输出，即不可信文本，没测试不敢发。**其余那些（走势图、findings 折叠、
+  diff 高亮、SSE 收敛）仍然只有手工验过**：它们错了就是显示不对，不会像 md
+  渲染那样变成安全问题。补齐要引入一整套浏览器测试依赖，对一个单文件面板不划算
+  —— 现状是明确的取舍，不是遗漏。
 
   好在切分之后这块的爆炸半径小了：前端错了就是显示不对，不会像以前那样
   牵动进程管理（那部分整个搬进核心了，有 `test_api_*` 守着）。

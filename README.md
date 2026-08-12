@@ -85,6 +85,10 @@ rloop web
 ```
 
 网页面板，走势折线图、findings 折叠着色、diff 高亮、实时进度、带参数起一轮。
+`report.md` / `review.md` / `response.md` 按 markdown 渲染（表格是表格、标题是标题），
+日志和 JSON 保持原文。走势表带每轮的实付 token 和整个 loop 的合计，列表页每张卡片
+上也有总账 —— 哪个 loop 烧得多不用点进去看。
+
 它是一个**独立程序**（`rloopgui/`），零 `import rloop` —— 数据全部经 `rloop api`
 拿。删掉整个 `rloopgui/`，rloop 照常工作。见 `rloopgui/README.md`。
 

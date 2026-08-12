@@ -70,6 +70,8 @@ h2:first-child{margin-top:0}
 .meta dt{color:var(--dim)}
 .meta dd{margin:0;word-break:break-all}
 table{border-collapse:collapse;font:12px var(--mono)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.tot td{border-top:1px solid var(--line);padding-top:5px}
 th,td{padding:3px 14px 3px 0;text-align:left}
 th{color:var(--dim);font-weight:500}
 .f{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;background:var(--panel)}
@@ -90,6 +92,26 @@ pre{font:12px/1.5 var(--mono);background:var(--panel);border:1px solid var(--lin
   border-radius:8px;padding:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word}
 pre.raw{white-space:pre;word-break:normal}
 .d-add{color:var(--ok)} .d-del{color:var(--err)} .d-hd{color:var(--accent);font-weight:600}
+/* 渲染出来的 markdown。行宽收窄一点 —— report.md 里成段的中文顶满一屏很难读 */
+.md{line-height:1.7;max-width:76ch}
+.md .md-h{margin:18px 0 8px;line-height:1.35}
+.md h1.md-h{font-size:19px} .md h2.md-h{font-size:16px} .md h3.md-h{font-size:14px}
+.md h4.md-h,.md h5.md-h,.md h6.md-h{font-size:13px;color:var(--dim)}
+.md p{margin:8px 0}
+.md ul,.md ol{margin:8px 0;padding-left:22px}
+.md li{margin:3px 0}
+.md li.md-sub{margin-left:18px;list-style-type:circle}
+.md code{font:12px var(--mono);background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;padding:1px 5px}
+.md pre.md-code{margin:10px 0}
+.md pre.md-code code{background:none;border:none;padding:0}
+.md blockquote{margin:10px 0;padding:2px 0 2px 12px;border-left:3px solid var(--line);color:var(--dim)}
+.md hr{border:0;border-top:1px solid var(--line);margin:16px 0}
+.md table.md-t{margin:10px 0;font:12px var(--mono);border-collapse:collapse}
+.md table.md-t th,.md table.md-t td{padding:4px 12px;border:1px solid var(--line);text-align:left}
+.md table.md-t th{background:var(--panel);font-weight:600}
+.md a{color:var(--accent)}
+.md strong{font-weight:600}
 #run{font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word}
 /* 事件的 level 直接当 class 用 —— 面板不做任何 status→颜色的判断，
    那一步在核心里做完了随数据一起来。 */
@@ -189,6 +211,102 @@ const post=(p,b)=>fetch(p+"?t="+T,{method:"POST",headers:{"Content-Type":"applic
   body:JSON.stringify(b||{})}).then(r=>r.json());
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
+// ── markdown ──────────────────────────────────────────────────────────
+// report.md / review.md / response.md 以前是塞进 <pre> 的纯文本：表格是一堆竖线，
+// 标题带着 ##，加粗是一对星号。这些文件本来就是 markdown，该按 markdown 看。
+//
+// 自己写而不是引库：页面必须零外部引用（Browser 面板里没有网），而这里要渲染的
+// 就那么几种结构。**渲染的是 reviewer 的输出，即不可信文本** —— 所以顺序是先
+// 整段 esc()、再解析结构：解析阶段看到的 `<` 已经是 `&lt;`，任何标签都构造不出来。
+// 唯一能绕过这条的是 URL（不含 &<> 就原样活下来），所以链接单独走协议白名单。
+const mdUrl=u=>/^(https?:\/\/|mailto:|#|\/|\.{0,2}\/)/i.test(String(u).trim())?String(u).trim():null;
+
+function mdInline(t){
+  // 行内代码先占位抽走，免得代码里的 * _ ~ 被当成格式符
+  const code=[];
+  t=t.replace(/`([^`]+)`/g,(_,c)=>`\u0000${code.push(c)-1}\u0000`);
+  t=t.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g,(m,txt,url)=>{
+    const u=mdUrl(url);
+    return u?`<a href="${u.replace(/"/g,"&quot;")}" target="_blank" rel="noopener noreferrer">${txt}</a>`:m;
+  });
+  t=t.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
+     .replace(/(^|[\s(（])\*([^*\s][^*]*)\*/g,"$1<em>$2</em>")
+     .replace(/~~([^~]+)~~/g,"<del>$1</del>");
+  return t.replace(/\u0000(\d+)\u0000/g,(_,i)=>`<code>${code[+i]}</code>`);
+}
+
+function mdRender(src){
+  const lines=esc(String(src??"")).split("\n");
+  const out=[]; let i=0, list=null;
+  const closeList=()=>{ if(list){ out.push(`</${list}>`); list=null; } };
+  const openList=(tag)=>{ if(list!==tag){ closeList(); out.push(`<${tag}>`); list=tag; } };
+
+  while(i<lines.length){
+    const ln=lines[i];
+
+    const fence=ln.match(/^\s*```+\s*([\w.+-]*)\s*$/);
+    if(fence){                                   // 代码块：里面一律不解析
+      closeList(); i++;
+      const buf=[];
+      while(i<lines.length && !/^\s*```+\s*$/.test(lines[i])) buf.push(lines[i++]);
+      i++;                                       // 吃掉收尾的 ```
+      out.push(`<pre class="md-code"><code>${buf.join("\n")}</code></pre>`);
+      continue;
+    }
+
+    const h=ln.match(/^(#{1,6})\s+(.*)$/);
+    if(h){ closeList(); const n=h[1].length;
+      out.push(`<h${n} class="md-h">${mdInline(h[2])}</h${n}>`); i++; continue; }
+
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)){ closeList(); out.push("<hr>"); i++; continue; }
+
+    // 表格：一行表头 + 一行分隔（|---|:--:|）才算，否则那些竖线只是普通文本
+    if(ln.includes("|") && i+1<lines.length && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i+1])
+       && lines[i+1].includes("-")){
+      closeList();
+      const cells=r=>r.replace(/^\s*\|/,"").replace(/\|\s*$/,"").split("|").map(c=>c.trim());
+      const align=cells(lines[i+1]).map(c=>
+        /^:-+:$/.test(c)?" style=\"text-align:center\"":/-+:$/.test(c)?" style=\"text-align:right\"":"");
+      const th=cells(ln).map((c,n)=>`<th${align[n]||""}>${mdInline(c)}</th>`).join("");
+      const rows=[]; i+=2;
+      while(i<lines.length && lines[i].includes("|") && lines[i].trim()){
+        rows.push(`<tr>${cells(lines[i]).map((c,n)=>`<td${align[n]||""}>${mdInline(c)}</td>`).join("")}</tr>`);
+        i++;
+      }
+      out.push(`<table class="md-t"><thead><tr>${th}</tr></thead><tbody>${rows.join("")}</tbody></table>`);
+      continue;
+    }
+
+    const q=ln.match(/^\s*&gt;\s?(.*)$/);       // esc 之后 > 已经变成 &gt;
+    if(q){ closeList();
+      const buf=[q[1]]; i++;
+      while(i<lines.length && /^\s*&gt;\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*&gt;\s?/,""));
+      out.push(`<blockquote>${mdInline(buf.join(" "))}</blockquote>`); continue; }
+
+    const ul=ln.match(/^(\s*)[-*+]\s+(.*)$/);
+    const ol=ln.match(/^(\s*)\d+[.)]\s+(.*)$/);
+    if(ul||ol){
+      const m=ul||ol;
+      openList(ul?"ul":"ol");
+      const indent=m[1].length>=2?' class="md-sub"':"";
+      out.push(`<li${indent}>${mdInline(m[2])}</li>`); i++; continue;
+    }
+
+    if(!ln.trim()){ closeList(); i++; continue; }
+
+    closeList();
+    const buf=[ln]; i++;                         // 连续非空行并成一段
+    while(i<lines.length && lines[i].trim() && !/^(\s*([-*+]|\d+[.)])\s|#{1,6}\s|\s*&gt;|\s*```)/.test(lines[i]))
+      buf.push(lines[i++]);
+    out.push(`<p>${mdInline(buf.join("<br>"))}</p>`);
+  }
+  closeList();
+  return out.join("\n");
+}
+// ── /markdown ─────────────────────────────────────────────────────────
+// 上面这段（含 esc）是自足的：不碰 DOM、不碰全局状态，所以能被抽出来单测。
+// tests/test_gui_markdown.py 就是照这两条边界注释切的 —— 别把 DOM 代码写进去。
+
 let loops=[], cur=null, detail=null, tab="result", fileCache={}, es=null;
 let runBuf=[], lastSeq=0, following=null, meta={}, viewRound=null;
 
@@ -204,6 +322,24 @@ function shortWhen(l){
 function fmtScore(l){
   if(l.deliverable==null) return "—";
   return `${l.deliverable}/${l.production} 阻塞 ${l.blocking}`;
+}
+
+// 整个 loop 的总账。报「实付」而不是 input 总数 —— 后者九成是缓存命中，
+// 直接看会以为贵十倍。缓存命中率单独列出来，那是省下来的部分。
+// 列表卡片上位置紧，用 k/M 缩写；详情页那份仍然给完整数字。
+const tok=v=>{const x=Number(v||0);
+  return x>=1e6?(x/1e6).toFixed(1)+"M":x>=1e3?Math.round(x/1e3)+"k":String(x);};
+
+function tokenTotal(hist, n){
+  const u = hist.filter(r=>r.usage).map(r=>r.usage);
+  if(!u.length) return "";
+  const sum = k => u.reduce((a,x)=>a+(x[k]||0), 0);
+  const inp = sum("input"), hit = sum("cached");
+  return `<tr class="tot"><td colspan="5">合计（${u.length} 轮）</td>
+    <td class="num">${n(sum("fresh"))}</td><td class="num">${n(sum("output"))}</td></tr>
+    <tr class="tot"><td colspan="7" class="dim">输入总量 ${n(inp)}，其中
+      ${Math.floor(hit*100/Math.max(1,inp))}% 是缓存命中${
+      u.length<hist.length?`　·　有 ${hist.length-u.length} 轮没有用量数据（reviewer 不是 codex）`:""}</td></tr>`;
 }
 
 function chart(h,min){
@@ -246,6 +382,8 @@ function drawList(){
       </div>
       <div class="row">
         <span class="dim" style="font-size:11px">第 ${l.round}/${l.max_rounds} 轮</span>
+        ${l.usage_total?`<span class="dim" style="font-size:11px"
+           title="整个 loop 的实付输入 / 输出（已扣掉缓存命中）">· ${tok(l.usage_total.fresh)} 入 / ${tok(l.usage_total.output)} 出</span>`:""}
         ${l.running?'<span class="accent" style="font-size:11px">跑着</span>':""}
         ${l.needs_response?'<span class="nudge">待回应</span>':""}
       </div>
@@ -339,12 +477,20 @@ function resultView(l,rv,d){
     h+=`<h2 class="err">结果不自洽</h2><ul class="err">${l.consistency_errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul>`;
 
   if(d.history&&d.history.length){
+    // 用量只有 codex 吐得出来（它的事件流里带 usage），reviewer 是 claude 时整段
+    // 拿不到 —— 那就干脆不加这两列，凭空多两列空的比不显示更碍眼。终端同理。
+    const hasU=d.history.some(r=>r.usage);
+    const n=v=>Number(v||0).toLocaleString();
     h+=`<h2>走势</h2>${chart(d.history,l.min_score)}
-      <table><tr><th>轮</th><th>交付物</th><th>生产就绪</th><th>阻塞</th><th>判定</th></tr>
+      <table><tr><th>轮</th><th>交付物</th><th>生产就绪</th><th>阻塞</th><th>判定</th>
+      ${hasU?`<th class="num" title="实付输入（扣掉缓存命中的部分）">实付入</th><th class="num">出</th>`:""}</tr>
       ${d.history.map(r=>`<tr class="${cls(r.row_class)}"><td>${r.round}</td>
         <td>${r.deliverable_maturity}</td><td>${r.production_readiness}</td>
         <td>${r.blocking_findings}</td><td>${esc(r.verdict)}
-        ${({up:"↑",down:"↓",flat:"=",start:""})[r.delta]||""}</td></tr>`).join("")}</table>`;
+        ${({up:"↑",down:"↓",flat:"=",start:""})[r.delta]||""}</td>
+        ${hasU?(r.usage?`<td class="num">${n(r.usage.fresh)}</td><td class="num">${n(r.usage.output)}</td>`
+                      :`<td class="num dim">—</td><td class="num dim">—</td>`):""}</tr>`).join("")}
+      ${hasU?tokenTotal(d.history,n):""}</table>`;
   }
 
   if(!d.review_valid) h+=`<h2>本轮结果</h2><div class="dim">这一轮还没有可用的 review 结果。</div>`;
@@ -387,6 +533,9 @@ function resultView(l,rv,d){
   return h;
 }
 
+// 哪些产物是 markdown。日志和 JSON 不在里面 —— 那些看原文才对。
+const MD_FILES=new Set(["report","review-md","response","prompt"]);
+
 function fileView(what, arts){
   const cr = viewRound || (detail&&detail.round);
   const key=what+cr, got=fileCache[key];
@@ -397,6 +546,9 @@ function fileView(what, arts){
     内容已截断（原始 ${got.bytes} 字节）。完整文件：<span class="loc">${esc(got.path)}</span></div>`:"";
   const rendered=got.rendered?`<div class="dim" style="font-size:12px;margin-bottom:8px">
     这份还没落盘，下面是现渲染的。</div>`:"";
+  // md 按 md 渲染；diff 走高亮；剩下的（日志、JSON）本来就该是等宽原文
+  if(MD_FILES.has(what))
+    return warn+rendered+`<div class="md">${mdRender(got.text)}</div>`;
   const body = what==="diff" ? hlDiff(got.text) : esc(got.text);
   return warn+rendered+`<pre class="${what==="diff"?"raw":""}">${body}</pre>`;
 }

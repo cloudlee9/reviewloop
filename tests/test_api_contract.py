@@ -92,6 +92,14 @@ def test_declared_artifacts_all_resolve_to_a_path(tmp_path):
         assert isinstance(p, Path) and p.name
 
 
+def test_the_loop_summary_carries_the_token_bill():
+    """列表页是「哪个 loop 贵」最该一眼看见的地方，别逼人逐个点进去。"""
+    src = (REPO_ROOT / "rloop.py").read_text(encoding="utf-8")
+    assert '"usage_total": usage_total(hist)' in src, "loop 摘要里没有用量总账"
+    page = (REPO_ROOT / "rloopgui" / "page.html").read_text(encoding="utf-8")
+    assert "usage_total" in page, "面板拿到了总账却没显示"
+
+
 def test_the_sandbox_tier_reaches_the_panel_both_ways(tmp_path):
     """档位得**看得见**也**选得着**，两头都要通。
 
