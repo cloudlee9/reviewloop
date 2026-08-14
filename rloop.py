@@ -190,6 +190,10 @@ deliverable_maturity。真实依赖一次都没被跑通过时，production_read
 打分纪律：
 
 - 每个分数都要有你**亲眼看到的**证据撑着。引文件、行号、命令输出。没验证过的推测不算证据。
+- 上面那条封顶规则一旦生效，**必须在 `summary` 里说明白**：封的是哪个分、封在几分、
+  触发的是哪一条、以及**具体要哪一次验证才能解封**（不是"跑通端到端"这种空话，
+  要具体到哪条命令、哪个依赖）。作者看不见你的规则，只看得见分数 —— 不写清楚，
+  他就得花一整轮来问你为什么。
 - 不要为了显得好说话而抬分，也不要为了显得严谨而压分。
 - 这一轮的改动如果确实修好了东西，分数**就该往上走**。该动不动，和虚抬一样是失职。
 - blocking_findings 只数 critical + high 两级。
@@ -976,6 +980,69 @@ def infer_label(diff_text: str, focus: str | None = None, parts: int = 2) -> str
     return "、".join(top)[:LABEL_MAX_CHARS]
 
 
+def patch_file_stats(patch: str) -> dict:
+    """从补丁文本里数出每个文件的增删行数：`{路径: (加, 减)}`。
+
+    只解析补丁头和 +/- 行，**不碰仓库**。想拿到「这一轮相对上一轮改了什么」，
+    解包两份快照再 `git apply` 是能算得更准，但每轮要把整个仓库解两遍、
+    base 变过之后 apply 还会失败 —— 而真正要用的只是文件名和大致增删量。
+    """
+    stats, cur = {}, None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            # `diff --git a/x b/x`，取 b 侧；路径带空格时 a/ b/ 的切法仍然可靠
+            _, _, rest = line.partition(" a/")
+            cur = rest.partition(" b/")[2] or rest
+            stats.setdefault(cur, [0, 0])
+        elif cur:
+            if line.startswith("+") and not line.startswith("+++"):
+                stats[cur][0] += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                stats[cur][1] += 1
+    return {k: tuple(v) for k, v in stats.items()}
+
+
+def round_delta_note(prev_patch: str, cur_patch: str, claimed: str = "") -> str:
+    """「上一轮之后到底改了什么」的那张表。
+
+    rloop 一直是把这活外包给 reviewer 的（给它上一轮补丁的路径，让它自己 diff
+    两个文件）。它照做了，但两个补丁 diff 出来是「补丁的补丁」：实测 reviewer
+    跑出来的是 `{round-04 => round-05}/diff.patch | 250 +++---` —— 一整行，
+    per-file 粒度全没了。
+
+    自己算就顺带能做一件外包做不到的事：把这些文件名和作者在 response 里自称
+    改过的文件对一遍。「说改了两份 PRD、实际只有一份」这种当场就露馅。
+    """
+    prev, cur = patch_file_stats(prev_patch), patch_file_stats(cur_patch)
+    rows, touched = [], []
+    for path in sorted(set(prev) | set(cur)):
+        pa, pd = prev.get(path, (0, 0))
+        ca, cd = cur.get(path, (0, 0))
+        if (ca, cd) == (pa, pd):
+            continue                      # 这一轮没动它
+        touched.append(path)
+        rows.append(f"  {path:<48} {ca - pa:+d} / {cd - pd:+d}")
+    if not rows:
+        return "\n\n## 上一轮之后的改动\n\n**送审补丁与上一轮逐字节相同 —— 作者一行代码都没改。**\n"
+
+    note = ("\n\n## 上一轮之后的改动\n\n"
+            "（按送审补丁算出来的，格式是 `路径  新增行数变化 / 删除行数变化`。"
+            "这是你上次看过之后真正动了的文件。）\n\n```\n" + "\n".join(rows) + "\n```\n")
+
+    # 和作者自称改过的文件对账。只报「他说了但没动」这一个方向 —— 反过来
+    # （动了没说）在正常改动里太常见（顺手改个格式、补个 import），报了全是噪音。
+    if claimed:
+        missing = [f for f in re.findall(r"[\w./-]+\.[A-Za-z0-9]{1,6}", claimed)
+                   if "/" in f and f not in touched and any(f in k or k in f for k in prev) is False
+                   and f not in prev and f not in cur]
+        named = [f for f in dict.fromkeys(missing) if len(f) > 4][:8]
+        if named:
+            note += ("\n作者在回应里提到了这些路径，但它们**这一轮没有出现在改动里**："
+                     f"{'、'.join('`' + f + '`' for f in named)}。"
+                     "可能是他说改了却没改，也可能只是顺口提到 —— 值得核一下。\n")
+    return note
+
+
 def build_context_pack(loop: Loop, rnd: int) -> str:
     """每轮为 reviewer 重建全部上下文。reviewer 是无状态的。"""
     s = loop.state
@@ -1010,9 +1077,15 @@ def build_context_pack(loop: Loop, rnd: int) -> str:
     if rnd > 1:
         diff_note += (
             f"\n\n第 2 轮起，补丁里还叠着作者后续的修改。上一轮的补丁在 "
-            f"`{loop.round_path(rnd - 1) / 'diff.patch'}` —— 把这两个文件 diff 一下，"
-            f"就能单独看出你上次看过之后又变了什么。"
+            f"`{loop.round_path(rnd - 1) / 'diff.patch'}`。"
         )
+        # 这张增量表以前是让 reviewer 自己 diff 两个补丁算的 —— 算出来是「补丁的
+        # 补丁」，per-file 粒度全丢。自己算，顺带和 response 里自称改过的文件对账。
+        with contextlib.suppress(Exception):
+            prev_patch = read_text_safe(loop.round_path(rnd - 1) / "diff.patch")
+            if prev_patch:
+                claimed = read_text_safe(loop.round_path(rnd - 1) / "response.md")
+                diff_note += round_delta_note(prev_patch, diff, claimed)
     diff_note += (
         "\n\n先读补丁，然后直接去看文件本身 —— 光看 diff 判断不了周围的代码"
         "是否让这个改动是安全的。"
@@ -1053,10 +1126,23 @@ def build_context_pack(loop: Loop, rnd: int) -> str:
                 )
 
     log = run_git(project, "log", "--oneline", "-10", "--no-decorate").strip()
+    # focus 是作者写的自由文本，原样嵌进来。**不改他的标题层级** —— 写得用心的
+    # focus 自带结构，把 `##` 压成 `####` 等于用改坏他的输入来解决我们的拼接问题。
+    # 代价是他的 `## 审什么` 会和下面 REVIEW_CHECKLIST 里内置的 `## 审什么` 撞名，
+    # 两段还可能指向相反的方向（真实案例：作者写「审这批任务卡的内容」，内置清单
+    # 写「改动的代码，先读 diff」，prompt 里没有一个字交代听谁的）。所以给它一条
+    # 明确的边界，再把优先级写死：作者的侧重优先。
     intent = f"""\
 ## 作者说了想让你侧重什么
 
+**下面到「侧重结束」为止都是作者写的。它优先于后面那份通用清单** —— 两边冲突时听
+作者的，通用清单退成兜底。作者要你审的层面（代码实现 / 机制设计 / 某批产物的内容 /
+文档契约）如果和你的默认习惯不一样，按他说的来，并在 `summary` 开头一句话点明
+你这一轮是按哪个层面审的。他没有明说层面时，默认审改动的代码。
+
 {s['focus']}
+
+（侧重结束）
 """ if s.get("focus") else """\
 ## 意图
 
@@ -1087,7 +1173,22 @@ def build_context_pack(loop: Loop, rnd: int) -> str:
 """
         resp = loop.round_path(rnd - 1) / "response.md"
         if resp.exists():
+            # 这段抬头是有代价换来的。prompt 上面刚说过「作者的反驳可以让你认为
+            # 这条 finding 本来就不成立」，却从没说过反方向 —— 于是作者随口一句
+            # 错的事实陈述能直接长成一条 finding。真实案例：作者三轮断言「某接口
+            # 目前不存在」，reviewer 照单全收开了一条 finding、还写进了 summary，
+            # 下一轮作者自己查出接口一直都在（router.go 里注册着），那条才被撤。
+            #
+            # **限定在「据此开新 finding」这一个场景**，不要泛化成「别信作者」：
+            # 他绝大多数交代是对的，让 reviewer 普遍怀疑 response 只会让它反复
+            # 重验已经修好的东西，还会不敢再给 rebutted_and_accepted。
             prior += (f"\n## 作者对这些 findings 的逐条交代与反驳\n\n"
+                      f"下面是作者的一面之词 —— 判断上一轮那些 findings 修没修，它是主要依据；"
+                      f"但**当你打算据此开一条新的 finding 时，它只是待核实的线索，不是证据**。"
+                      f"尤其这几类断言：「某某接口/文件/字段不存在」「已经删掉了」「还没上线」"
+                      f"「我实测过 X」「这个值来自 Y」—— 你有 shell，自己去查一眼（读源码、"
+                      f"跑一条命令）再用。查不动就在 finding 里写明「该前提来自作者陈述、未经核实」。"
+                      f"**不要仅凭作者的一句话开一条 finding。**\n\n"
                       f"{read_text_safe(resp)}\n")
         else:
             prior += ("\n（作者没有为上一轮的 findings 留下任何书面交代。"
@@ -1806,6 +1907,47 @@ def gate_pass(review: dict, min_score: float) -> bool:
     )
 
 
+DEADLOCK_ROUNDS = 3          # 同一条 finding 连续这么多轮 not_fixed 就认定为僵局
+
+
+def detect_deadlock(loop: "Loop", rnd: int) -> list[str]:
+    """找出双方顶住不动的 finding —— 返回陷入僵局的 id。
+
+    真实案例：一条 finding 连续七轮 `not_fixed`，作者每轮都写了实质回应（业务上
+    这台设备就是流动使用的，绑死反而与现场不符），reviewer 每轮拿新证据不认。
+    这时 `gate_pass` 要求 blocking 归零、而未修好的 finding 又被强制重列，
+    **这个 loop 在数学上已经不可能 converged**，只能白跑到轮数上限。
+
+    判据要两边都占：
+    - 同一个 id 连续 `DEADLOCK_ROUNDS` 轮被判 `not_fixed`；
+    - 这几轮作者**每轮都写了实质回应**。作者不吭声那不叫僵局，那叫没干活，
+      该继续跑。
+
+    **这不给任何人放行的权力。** 认定僵局只改变「还要不要接着烧配额」，
+    不改变判定：出口仍是未达标，findings 原样交给人。设计上刻意不做成
+    「作者声称需要决策就不算阻塞」—— 那等于给了一条绕开门禁的通路，而在上面
+    那个真实案例里，reviewer 到最后一轮仍坚持问题实存，它并不认为这只是业务取舍。
+    """
+    if rnd < DEADLOCK_ROUNDS + 1:
+        return []
+    stuck: dict[str, int] = {}
+    for r in range(rnd, rnd - DEADLOCK_ROUNDS, -1):
+        review = load_review(loop, r)
+        if not review:
+            return []
+        # 作者那一轮的回应写在**上一轮**的目录里（reviewer 是读着它来判这一轮的）。
+        # read_text_safe 不兜文件不存在，得自己先看一眼。
+        resp_path = loop.round_path(r - 1) / "response.md"
+        resp = read_text_safe(resp_path).strip() if resp_path.exists() else ""
+        if len(resp) < 40:          # 空的或者一句「改好了」不算实质回应
+            return []
+        ids = {p.get("id") for p in (review.get("prior_findings_status") or [])
+               if p.get("status") == "not_fixed" and p.get("id")}
+        for i in ids:
+            stuck[i] = stuck.get(i, 0) + 1
+    return sorted(i for i, n in stuck.items() if n >= DEADLOCK_ROUNDS)
+
+
 def detect_stall(history: list) -> bool:
     """连续 STALL_ROUNDS 轮两个分数都没提升且 blocking 没下降 → 停滞。"""
     if len(history) < STALL_ROUNDS + 1:
@@ -2343,7 +2485,8 @@ def finish(loop: Loop, outcome: str, reason: str, code: int) -> int:
         loop.log(f"报告：{loop.root / 'report.md'}")
 
         icons = {"converged": "✅", "needs_work": "📋", "inconsistent": "⁉️",
-                 "stalled": "⚠️", "exhausted": "⚠️", "pinned_scope": "📌", "failed": "❌"}
+                 "stalled": "⚠️", "exhausted": "⚠️", "pinned_scope": "📌", "failed": "❌",
+                 "deadlocked": "🔒"}
         h = loop.state.get("history", [])
         tail = (f" 交付物 {h[-1]['deliverable_maturity']} / 生产就绪 {h[-1]['production_readiness']}"
                 if h else "")
@@ -2447,6 +2590,18 @@ def run_one_round(loop: Loop) -> int:
         loop.log(f"  用量   输入 {usage['input']:,}（缓存命中 "
                  f"{usage['cached'] * 100 // max(1, usage['input'])}%，"
                  f"实付 {usage['fresh']:,}） 输出 {usage['output']:,}")
+    # 门禁是三个条件的与，人盯着看的却往往只有分数 —— 真实案例：作者跑满 10 轮，
+    # 以为卡在生产就绪度上（它一直在涨），实际卡的是始终没归零的阻塞项。
+    # **只报「还差什么」，不预测「还要几轮」**：分数不是线性涨的，最后一段最难，
+    # 一个不靠谱的预测比不给更糟 —— 人会照着它决定停不停。
+    if entry["verdict"] != "pass" or entry["blocking_findings"]:
+        gap = [f"{k} 差 {v:.1f} 分" for k, v in (
+            ("交付物", s["min_score"] - entry["deliverable_maturity"]),
+            ("生产就绪", s["min_score"] - entry["production_readiness"])) if v > 0]
+        if entry["blocking_findings"]:
+            gap.append(f"{entry['blocking_findings']} 个阻塞项要清零")
+        if gap:
+            loop.log(f"  还差   {'；'.join(gap)}")
     if review.get("summary"):
         loop.log(f"  小结   {review['summary'][:200]}")
 
@@ -2474,6 +2629,16 @@ def run_one_round(loop: Loop) -> int:
                   f"但 reviewer 一条 findings 都没给")
         loop.log(f"  ! {reason}")
         return finish(loop, "inconsistent", reason, EXIT_INCONSISTENT)
+
+    # 僵局排在 stall 之前：分数还在涨（stall 判不出来）但某条 finding 焊死了的
+    # 时候，剩下的轮次一轮也换不来收敛 —— 那不是「无进展」，是「这条得人来拍板」。
+    locked = detect_deadlock(loop, rnd)
+    if locked:
+        reason = (f"{'、'.join(locked)} 连续 {DEADLOCK_ROUNDS} 轮判 not_fixed，"
+                  f"作者每轮都有实质回应 —— 双方顶住了，继续跑也不会收敛")
+        loop.log(f"  ! {reason}")
+        loop.log("    这不是放行：判定仍是未达标。请人看一眼这几条到底该怎么办。")
+        return finish(loop, "deadlocked", reason, EXIT_NEEDS_WORK)
 
     if detect_stall(history):
         reason = f"连续 {STALL_ROUNDS} 轮无进展"
@@ -2832,7 +2997,7 @@ STATUS_STYLE = {
     "converged": "ok", "pass": "ok", "fixed": "ok",
     "needs_work": "warn", "partially_fixed": "warn", "open": "warn",
     "running": "accent",
-    "stalled": "err", "exhausted": "err", "failed": "err",
+    "stalled": "err", "exhausted": "err", "failed": "err", "deadlocked": "err",
     "inconsistent": "err", "not_fixed": "err", "aborted": "dim",
     "pinned_scope": "dim", "rebutted_and_accepted": "ok",
 }

@@ -92,6 +92,10 @@ pre{font:12px/1.5 var(--mono);background:var(--panel);border:1px solid var(--lin
   border-radius:8px;padding:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word}
 pre.raw{white-space:pre;word-break:normal}
 .d-add{color:var(--ok)} .d-del{color:var(--err)} .d-hd{color:var(--accent);font-weight:600}
+/* 进度 tab 上的「正在跑」指示。刻意只是个提示：跑起来不自动把人切过去 ——
+   他可能正对着 review.md 改代码，被拽走比看不见更烦。 */
+.live{color:var(--accent);margin-left:5px;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 /* 渲染出来的 markdown。行宽收窄一点 —— report.md 里成段的中文顶满一屏很难读 */
 .md{line-height:1.7;max-width:76ch}
 .md .md-h{margin:18px 0 8px;line-height:1.35}
@@ -438,7 +442,8 @@ function drawDetail(){
   const cr = viewRound || detail.round;
 
   const head=`<div class="tabs">${TABS.map(([k,t])=>
-      `<button data-tab="${k}" class="${tab===k?"on":""}">${t}</button>`).join("")}
+      `<button data-tab="${k}" class="${tab===k?"on":""}">${t}${
+        k==="run"&&l.running?`<span class="live" title="这一轮正在跑">●</span>${elapsed()}`:""}</button>`).join("")}
     ${rounds.length>1?`<select class="rounds" id="round-sel">${rounds.map(n=>
       `<option value="${n}" ${n===cr?"selected":""}>第 ${n} 轮</option>`).join("")}</select>`:""}
   </div>`;
@@ -536,6 +541,20 @@ function resultView(l,rv,d){
 // 哪些产物是 markdown。日志和 JSON 不在里面 —— 那些看原文才对。
 const MD_FILES=new Set(["report","review-md","response","prompt"]);
 
+// 跑一轮十几分钟，中间不知道跑了多久、还在不在动，人就会去猜要不要打断。
+// 时间戳从 run.start 事件来（流里本来就有），纯前端算。
+let runStartedAt=null;
+function elapsed(){
+  if(!runStartedAt) return "";
+  const s=Math.max(0,Math.round((Date.now()-runStartedAt)/1000));
+  return ` <span class="dim" style="font-weight:400">${s<60?s+"s":Math.floor(s/60)+"m"+String(s%60).padStart(2,"0")+"s"}</span>`;
+}
+setInterval(()=>{                       // 只重画 tab 那一条，不整块重绘
+  if(!runStartedAt||!cur||!cur.running) return;
+  const b=document.querySelector('.tabs button[data-tab="run"]');
+  if(b&&detail) b.innerHTML=`进度<span class="live" title="这一轮正在跑">●</span>${elapsed()}`;
+},1000);
+
 function fileView(what, arts){
   const cr = viewRound || (detail&&detail.round);
   const key=what+cr, got=fileCache[key];
@@ -617,6 +636,8 @@ function onEvent(ev){
     return;
   }
   if(ev.kind==="heartbeat") return;
+  if(ev.kind==="run.start") runStartedAt=Date.now();
+  if(ev.kind==="run.end") runStartedAt=null;
   const line=`<span class="${cls(ev.level)}">${esc(ev.text||"")}</span>\n`;
   runBuf.push(line);
   if(runBuf.length>4000) runBuf.splice(0,runBuf.length-4000);

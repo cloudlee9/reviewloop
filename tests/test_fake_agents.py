@@ -787,6 +787,46 @@ def test_no_verify_puts_the_codex_reviewer_back_behind_read_only(tmp_path):
     assert r.loop.state["verify"] is False, "loop.json 没记下这一档，续跑会悄悄变回放开"
 
 
+def test_a_standoff_ends_the_loop_instead_of_burning_every_round(tmp_path):
+    """双方顶住的 finding 会让门禁在数学上无法通过 —— 早点交给人，别烧满轮次。
+
+    真实案例：一条 finding 连续七轮 `not_fixed`，作者每轮都写了实质回应（业务上
+    这台设备就是流动使用的），reviewer 每轮拿新证据不认。未修好的 finding 被强制
+    重列进 findings，而 gate 要求 blocking 归零 —— 从第 4 轮起就不可能 converged，
+    却还得跑到第 10 轮才停。
+
+    出口是 `deadlocked`，**不是放行**：判定仍是未达标，findings 原样交给人。
+    """
+    stuck = {"id": "F1", "severity": "high", "category": "correctness", "file": "app.py",
+             "line": 1, "description": "顶住的那条。", "suggested_fix": "作者不认同的改法。"}
+    prior = [{"id": "F1", "status": "not_fixed", "note": "作者的反驳不能解决这一点"}]
+    # **分数每轮都在涨** —— 这正是真实案例的样子，也是 detect_stall 判不出来的原因：
+    # 别处都在进步，只有这一条焊死了。分数不动的话 stalled 会先熔断，那是另一回事。
+    h = Harness(tmp_path / "standoff",
+                [review(deliverable=5.0 + i * 0.5, production=4.0 + i * 0.4,
+                        findings=[stuck], prior=(prior if i else None))
+                 for i in range(6)])
+
+    rc = None
+    for rnd in range(1, 7):
+        r = h.run()
+        rc = r.rc
+        if r.state.get("status") == "done":
+            break
+        h.write_response(r.loop, rnd, "这是业务事实：设备在现场就是流动使用的，"
+                                      "绑死反而与实际不符，需要产品侧确认部署方式。")
+        h.author_edits()
+
+    assert r.state["outcome"] == "deadlocked", \
+        f"顶住的 finding 没有触发提前熔断，跑到了 {r.state.get('outcome')}"
+    assert rc == rloop.EXIT_NEEDS_WORK, "作废/放行都不对：这一轮仍是未达标"
+    assert r.state["round"] < r.state["max_rounds"], "熔断得比轮数上限早，否则等于没熔断"
+
+    log = (r.loop.root / "loop.log").read_text("utf-8")
+    assert "F1" in log and "顶住" in log
+    assert "这不是放行" in log, "没说清 deadlocked 不等于通过"
+
+
 def test_json_mode_still_shows_the_findings_to_the_human(tmp_path):
     """`--json` 不等于「什么都不给人看」。
 

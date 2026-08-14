@@ -917,6 +917,90 @@ def test_the_permission_note_matches_what_the_reviewer_can_actually_do():
     assert "触发不了" in claude_note and "本来就不作数" in claude_note
 
 
+def _deadlock_fixture(tmp_path, statuses, resp="作者的实质回应：这台设备在现场就是流动使用的，"
+                                             "绑死反而与实际不符，需要产品侧确认部署方式。"):
+    """造一个 loop：statuses[i] 是第 i+1 轮对 F3 的裁决。"""
+    loop = make_loop(tmp_path)
+    for i, st in enumerate(statuses, 1):
+        write_review(loop, i, json.dumps(review_obj(
+            prior_findings_status=[{"id": "F3", "status": st, "note": "n"}])))
+        if resp:
+            (loop.round_dir(i) / "response.md").write_text(resp, encoding="utf-8")
+    return loop
+
+
+def test_a_finding_both_sides_dig_in_on_ends_the_loop_early(tmp_path):
+    """真实案例：一条 finding 连续七轮 not_fixed，作者每轮都有实质回应。
+
+    这时门禁在数学上已经不可能通过（未修好的 finding 被强制重列进 findings，
+    而 gate 要求 blocking 归零），剩下的轮次一轮也换不来收敛 —— 白烧配额。
+    """
+    loop = _deadlock_fixture(tmp_path, ["not_fixed"] * 4)
+    assert rloop.detect_deadlock(loop, 4) == ["F3"]
+
+
+def test_deadlock_needs_the_author_to_have_actually_answered(tmp_path):
+    """作者不吭声不叫僵局，那叫没干活 —— 该继续跑，不该熔断。"""
+    loop = _deadlock_fixture(tmp_path, ["not_fixed"] * 4, resp="")
+    assert rloop.detect_deadlock(loop, 4) == []
+
+    # 一句「改好了」也不算实质回应
+    thin = _deadlock_fixture(tmp_path / "thin", ["not_fixed"] * 4, resp="改好了。")
+    assert rloop.detect_deadlock(thin, 4) == []
+
+
+def test_a_finding_that_moved_recently_is_not_a_deadlock(tmp_path):
+    """中间判过一次 partially_fixed 就说明还在动，连续性断了。"""
+    loop = _deadlock_fixture(tmp_path, ["not_fixed", "partially_fixed", "not_fixed", "not_fixed"])
+    assert rloop.detect_deadlock(loop, 4) == []
+
+
+def test_deadlock_needs_enough_rounds_to_judge(tmp_path):
+    """开局两三轮顶住很正常，别急着熔断。"""
+    loop = _deadlock_fixture(tmp_path, ["not_fixed"] * 3)
+    assert rloop.detect_deadlock(loop, 3) == []
+    assert rloop.DEADLOCK_ROUNDS == 3
+
+
+def test_the_round_delta_names_files_the_author_claimed_but_did_not_touch():
+    """「说改了两份 PRD、实际只有一份」当场露馅 —— 这是自己算增量的主要理由。
+
+    以前是把活外包给 reviewer（给它上轮补丁的路径让它自己 diff），它照做了，
+    但两个补丁 diff 出来是「补丁的补丁」：实测输出成了
+    `{round-04 => round-05}/diff.patch | 250 +++---` 一整行，per-file 粒度全丢。
+    """
+    def patch(*files):
+        out = []
+        for name, adds in files:
+            out.append(f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@\n")
+            out += [f"+line{i}\n" for i in range(adds)]
+        return "".join(out)
+
+    prev = patch(("scripts/expand.py", 2), ("docs/PRD-A.md", 1))
+    cur = patch(("scripts/expand.py", 4), ("docs/PRD-A.md", 1), ("tests/test_new.py", 2))
+
+    note = rloop.round_delta_note(prev, cur, "本轮改了 docs/PRD-A.md 和 docs/PRD-B.md 两份")
+    assert "scripts/expand.py" in note, "这轮多改的文件没列出来"
+    assert "tests/test_new.py" in note, "新增的文件没列出来"
+    assert "docs/PRD-A.md" not in note.split("作者在回应里")[0], \
+        "这轮没动的文件不该出现在改动表里"
+    assert "docs/PRD-B.md" in note, "作者自称改了、实际没动的文件没被点名"
+
+
+def test_an_unchanged_patch_is_called_out_not_left_blank():
+    """作者一行没改时要明说 —— 空白会被当成「没算出来」。"""
+    same = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@\n+x\n"
+    note = rloop.round_delta_note(same, same, "")
+    assert "一行代码都没改" in note
+
+
+def test_patch_file_stats_counts_adds_and_dels_not_headers():
+    """`+++ b/x` 和 `--- a/x` 是文件头，不是增删行。"""
+    patch = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@\n"
+             "+new\n-old\n context\n")
+    assert rloop.patch_file_stats(patch) == {"a.py": (1, 1)}
+
+
 def test_the_loop_total_reports_what_you_actually_pay():
     """报「实付」而不是 input 总数 —— 后者九成是缓存命中，照它看会以为贵十倍。"""
     hist = [

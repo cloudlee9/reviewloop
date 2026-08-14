@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -401,6 +402,64 @@ def make_state_loop(tmp_path, repo: Path, base: str, target: str | None) -> rloo
         "max_rounds": 3, "min_score": 8.0, "history": [],
     })
     return loop
+
+
+def test_the_pack_says_the_authors_focus_wins_over_the_builtin_checklist(tmp_path):
+    """作者的 focus 和内置清单可能指向相反的方向，prompt 得说清听谁的。
+
+    真实案例：作者写「审这批任务卡的内容」，内置 REVIEW_CHECKLIST 写「改动的代码，
+    先读 diff」—— 同一份 prompt 里出现两个 `## 审什么`，一个字都没交代优先级。
+    那一轮 27 条 finding 里 18 条落在一次性脚本上，换个训练场就全作废。
+
+    **不动作者的标题层级**：写得用心的 focus 自带结构，把 `##` 压成 `####` 等于
+    用改坏他的输入来解决我们的拼接问题。给边界 + 写死优先级就够了。
+    """
+    repo = make_repo(tmp_path)
+    head = commit(repo, "c1", **{"a.txt": "base\n"})
+    (repo / "a.txt").write_text("base\nmore\n", encoding="utf-8")
+    loop = make_state_loop(tmp_path, repo, head, None)
+    loop.update(focus="## 审什么\n\n审的是机制，不是这批数据。")
+    pack = rloop.build_context_pack(loop, 1)
+
+    assert "优先于后面那份通用清单" in pack, "没交代 focus 和内置清单谁优先"
+    assert "（侧重结束）" in pack, "focus 没有边界，和后面的内容糊在一起"
+    assert "## 审什么\n\n审的是机制" in pack, "作者的标题层级被改动了"
+    # 边界必须真的把 focus 包住：作者那段要落在「侧重结束」之前
+    assert pack.index("审的是机制") < pack.index("（侧重结束）")
+
+
+def test_the_pack_tells_the_reviewer_not_to_take_the_authors_word_as_evidence(tmp_path):
+    """作者随口一句错的事实陈述，能直接长成一条 finding。
+
+    真实案例：作者三轮断言「某接口目前不存在」，reviewer 照单全收开了 finding、
+    还写进了 summary；下一轮作者自己查出接口一直都在，那条才被撤。prompt 上面
+    刚说过「作者的反驳可以让你认为这条 finding 不成立」，却从没说过反方向。
+
+    限定在「据此开新 finding」这一个场景 —— 泛化成「别信作者」会让 reviewer
+    反复重验已经修好的东西。
+    """
+    repo = make_repo(tmp_path)
+    head = commit(repo, "c1", **{"a.txt": "base\n"})
+    (repo / "a.txt").write_text("base\nmore\n", encoding="utf-8")
+    loop = make_state_loop(tmp_path, repo, head, None)
+
+    prev = loop.round_dir(1)
+    (prev / "review.json").write_text(json.dumps({
+        "deliverable_maturity": 6.0, "production_readiness": 5.0,
+        "blocking_findings": 1, "verdict": "needs_work", "summary": "s",
+        "findings": [{"id": "F1", "severity": "high", "category": "correctness",
+                      "file": "a.txt", "line": 1, "description": "d", "suggested_fix": "f"}],
+    }, ensure_ascii=False), encoding="utf-8")
+    (prev / "response.md").write_text("F1：那个接口目前不存在，所以这条不成立。", encoding="utf-8")
+
+    pack = rloop.build_context_pack(loop, 2)
+
+    assert "待核实的线索，不是证据" in pack
+    assert "不要仅凭作者的一句话开一条 finding" in pack
+    assert "自己去查一眼" in pack
+    # 但不能把 response 贬成不可信：判上一轮修没修，它仍然是主要依据
+    assert "判断上一轮那些 findings 修没修，它是主要依据" in pack
+    assert "那个接口目前不存在" in pack, "作者的原文还是要原样给它看"
 
 
 def test_context_pack_writes_the_pinned_patch(tmp_path):
