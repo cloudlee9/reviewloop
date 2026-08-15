@@ -119,6 +119,7 @@ rloop web
   "scores": {"deliverable_maturity": 7.6, "production_readiness": 5.8,
              "blocking_findings": 2, "verdict": "needs_work"},
   "findings": [...], "prior_findings_status": [...],
+  "review_md_path": "...",   // 这一轮的人类可读版；作废/失败的轮次是 null
   "report_path": "...", "response_path": "...", "patch_path": "..."
 }
 ```
