@@ -101,7 +101,14 @@ def test_the_skill_tells_the_session_to_hand_over_the_round_file():
         text = (REPO_ROOT / "install" / name).read_text(encoding="utf-8")
         assert "review_md_path" in text, f"{name} 没说路径从载荷哪个字段拿"
         assert "review.md" in text and "response.md" in text
-        assert "markdown 链接" in text, f"{name} 没说要写成可点的链接"
+        assert "绝对路径" in text, f"{name} 没说路径该用哪种形式"
+        assert "[round-03/review.md]" in text, f"{name} 没给出可点链接的写法示例"
+        # 用绝对路径，别拼相对路径 —— 这条是踩出来的：客户端按**会话的工作目录**
+        # 解析链接，而被审项目未必就是工作目录（`-C` 指定项目、或在上层目录起的
+        # 会话都不是）。写 `.review-loops/…` 会解析到工作目录底下，用户点开只看到
+        # 「Couldn't read this file」。
+        assert "别自己拼相对路径" in text, f"{name} 没警告相对路径会点不开"
+        assert "相对项目根目录" not in text, f"{name} 还在教会话拼相对项目根的路径"
         # 时机是这条的全部意义：下一轮阻塞十几分钟，用户那时只能读上一轮的
         assert "下一轮" in text and "阻塞" in text, f"{name} 没交代为什么必须当轮就给"
 

@@ -115,13 +115,24 @@ rloop 自己会把完整结果打在终端上（`--json` 时走 stderr）：find
 **这轮改完、下一轮起之前**，把这两个文件贴出来：
 
 ```
-本轮详情：.review-loops/<loop-id>/round-03/review.md
-我的回应：.review-loops/<loop-id>/round-03/response.md
+本轮详情：<project>/.review-loops/<loop-id>/round-03/review.md
+我的回应：<project>/.review-loops/<loop-id>/round-03/response.md
 ```
 
-写成 markdown 链接（`[round-03/review.md](.review-loops/xxx/round-03/review.md)`），
-用**相对项目根目录**的路径 —— 终端里能直接点开。前者的绝对路径在 `--json` 载荷的
-`review_md_path` 里（这一轮没成的话是 `null`，那就别贴），后者是 `response_path`。
+路径**直接用载荷里的绝对路径**：`review_md_path`（这一轮没成的话是 `null`，那就
+别贴）和 `response_path`。链接文字用短的就行：
+
+```markdown
+[round-03/review.md](/Users/x/proj/.review-loops/<id>/round-03/review.md)
+```
+
+**别自己拼相对路径。** 客户端是按**你的工作目录**解析链接的，而被审项目未必就是
+你的工作目录 —— 用 `-C` 指定项目、或者在上层目录起的会话，两者就不一样。写
+`.review-loops/…` 会被解析到工作目录底下，那儿什么都没有，用户点开只看到
+「Couldn't read this file」。载荷给的绝对路径没有这个问题。
+
+（项目整个在你工作目录之外时，客户端打不开任何链接。那就别做成链接，把绝对路径
+当普通文本给出，让用户自己复制。）
 
 **时机就是全部意义所在。** 下一轮 `rloop` 是前台阻塞的，一跑几分钟到十几分钟，
 那段时间你不会输出任何东西 —— 用户干等着。他手里得有东西可读，而那东西只能是
