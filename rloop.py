@@ -33,7 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 # 对外契约版本。GUI 和任何第三方面板按它判断能不能对话；改字段语义要 +1。
 API_VERSION = 1
