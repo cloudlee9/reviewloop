@@ -827,6 +827,39 @@ def test_a_standoff_ends_the_loop_instead_of_burning_every_round(tmp_path):
     assert "这不是放行" in log, "没说清 deadlocked 不等于通过"
 
 
+def test_each_round_leaves_a_readable_file_and_says_where(tmp_path):
+    """每轮的人类可读版要落盘，路径要进载荷 —— 会话靠它给用户贴链接。
+
+    时机是关键：下一轮 `rloop` 前台阻塞十几分钟，那段时间会话不输出任何东西。
+    用户手里得有东西可读，而那只能是**上一轮**留下的。
+    """
+    finding = {"id": "F1", "severity": "high", "category": "correctness",
+               "file": "cache.py", "line": 42, "description": "过期判定用了本地时钟。",
+               "suggested_fix": "把过期时刻写进 value。"}
+    r = Harness(tmp_path / "md", [review(findings=[finding])]).run()
+
+    payload = json.loads(r.proc.stdout)
+    md = payload["review_md_path"]
+    assert md, "载荷里没给这一轮的 review.md 路径"
+    text = Path(md).read_text("utf-8")
+    assert "cache.py:42" in text and "过期判定用了本地时钟" in text, "落盘的那份不完整"
+    assert "本地时钟" in r.proc.stderr, "终端那份也得有 —— 两边同源"
+    assert "这一轮也写在" in r.proc.stderr, "没告诉人这份存哪了"
+
+
+def test_a_round_that_never_produced_a_review_gives_no_dead_link(tmp_path):
+    """作废/崩掉的轮次根本走不到渲染那步，这时给路径就是给死链接。"""
+    h = Harness(tmp_path / "void", [review()])
+    h.env["FAKE_TAMPER"] = str(h.project / "app.py")
+    h.env["FAKE_EVENTS"] = json.dumps(
+        [{"type": "item.completed", "item": {"type": "file_change", "path": "app.py"}}])
+    r = h.run()
+
+    assert r.rc == rloop.EXIT_ERROR
+    assert json.loads(r.proc.stdout)["review_md_path"] is None, \
+        "作废的轮次给了一个不存在的文件路径"
+
+
 def test_json_mode_still_shows_the_findings_to_the_human(tmp_path):
     """`--json` 不等于「什么都不给人看」。
 

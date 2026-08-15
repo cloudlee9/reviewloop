@@ -2207,6 +2207,7 @@ def emit_json(loop: Loop, code: int):
     voided = (s.get("fingerprint_note") or "").startswith("**这一轮作废**")
     if voided:
         review = {}
+    review_md = loop.round_path(rnd) / "review.md" if rnd else None
     payload = {
         "loop_id": s["id"],
         "project": s["project"],
@@ -2241,6 +2242,10 @@ def emit_json(loop: Loop, code: int):
         "validation_commands": review.get("validation_commands") or [],
         "history": s.get("history", []),
         "report_path": str(loop.root / "report.md"),
+        # 这一轮的人类可读版。**只在真写出来了才给** —— 作废或 reviewer 崩掉的
+        # 轮次根本走不到渲染那步，给个死链接比不给更糟。驱动循环的会话拿它贴给
+        # 用户看：下一轮一跑就是几分钟的前台阻塞，那几分钟正好用来读上一轮。
+        "review_md_path": str(review_md) if review_md and review_md.exists() else None,
         "response_path": str(loop.round_path(rnd) / "response.md") if rnd else None,
         "patch_path": str(loop.round_path(rnd) / "diff.patch") if rnd else None,
     }
@@ -4191,6 +4196,13 @@ def print_round_result(loop: Loop, stream=None) -> None:
     print(file=out)
     print(plain(render_detail(
         item, load_review(loop, item["round"]), min(110, max(60, width)))), file=out)
+    # 同一份内容也落了盘。刷屏之后想再看一眼、或者想在下一轮跑着的时候读，
+    # 得知道它在哪 —— 终端会滚走，文件不会。
+    md = loop.round_path(item["round"]) / "review.md"
+    if md.exists():
+        with contextlib.suppress(ValueError):
+            md = md.relative_to(Path(loop.state["project"]))
+        print(f"\n  这一轮也写在  {md}\n", file=out)
 
 
 def subcommands() -> set:

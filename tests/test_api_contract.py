@@ -92,6 +92,20 @@ def test_declared_artifacts_all_resolve_to_a_path(tmp_path):
         assert isinstance(p, Path) and p.name
 
 
+def test_the_skill_tells_the_session_to_hand_over_the_round_file():
+    """rloop 写了 review.md 没用 —— 得有人把链接递到用户手上。
+
+    这是「能力密度超过暴露面」那类问题：文件一直在，用户不知道。
+    """
+    for name in ("SKILL.claude.md", "SKILL.codex.md"):
+        text = (REPO_ROOT / "install" / name).read_text(encoding="utf-8")
+        assert "review_md_path" in text, f"{name} 没说路径从载荷哪个字段拿"
+        assert "review.md" in text and "response.md" in text
+        assert "markdown 链接" in text, f"{name} 没说要写成可点的链接"
+        # 时机是这条的全部意义：下一轮阻塞十几分钟，用户那时只能读上一轮的
+        assert "下一轮" in text and "阻塞" in text, f"{name} 没交代为什么必须当轮就给"
+
+
 def test_the_loop_summary_carries_the_token_bill():
     """列表页是「哪个 loop 贵」最该一眼看见的地方，别逼人逐个点进去。"""
     src = (REPO_ROOT / "rloop.py").read_text(encoding="utf-8")
